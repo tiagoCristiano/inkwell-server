@@ -82,6 +82,11 @@ const COMMENTS = [
 const REPLY = `${P.d} Obrigado pelo comentário! ${P.b}`;
 
 async function main() {
+  // Deploy runs with --if-empty so a redeploy never wipes real data; plain `npm run seed` still resets.
+  if (process.argv.includes("--if-empty") && (await prisma.user.count()) > 0) {
+    console.log("Database already has data, skipping seed.");
+    return;
+  }
   console.log("Clearing existing data...");
   await prisma.$executeRawUnsafe(
     'TRUNCATE TABLE "Notification", "TopicLike", "CommentLike", "ReadingEntry", "Comment", "Following", "CommunityMember", "Community", "Topic", "User" RESTART IDENTITY CASCADE',

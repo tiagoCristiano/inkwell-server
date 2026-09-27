@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "build": "npm install && npm --prefix admin install && npm run admin:build && npx prisma generate && npx prisma migrate deploy",
+    "build": "npm install && npm --prefix admin install && npm run admin:build && npx prisma generate && npx prisma migrate deploy && node prisma/seed.js --if-empty",
     "test": "echo \"Error: no test specified\" && exit 1",
     "seed": "node prisma/seed.js",
     "admin:dev": "npm --prefix admin run dev",
