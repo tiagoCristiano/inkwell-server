@@ -1,0 +1,218 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  user
+  moderator
+  admin
+}
+
+enum Gender {
+  masc
+  feminino
+  outro
+}
+
+model User {
+  username        String    @id
+  email           String?   @unique // nullable only so pre-email rows migrate; register always sets it
+  password        String    // scrypt "salt:hash" (legacy seed rows may still be plaintext, rehashed on login)
+  role            Role      @default(user)
+  display_name    String
+  bio             String    @default("")
+  gender          Gender?
+  age             Int?
+  is_public       Boolean   @default(true)
+  // Premium lifts the free-plan quotas enforced by the API (see FREE_LIMITS in index.js).
+  premium         Boolean   @default(false)
+  // Set by the admin "reset post balances" action: feed posts before it don't count toward the daily quota.
+  post_quota_reset_at DateTime?
+  avatar_data     Bytes?
+  avatar_content_type String?
+
+  topics          Topic[]
+  comments        Comment[]
+  communities     Community[]
+  memberships     CommunityMember[]
+  following       Following[] @relation("follower")
+  followers       Following[] @relation("followed")
+  topic_likes     TopicLike[]
+  comment_likes   CommentLike[]
+  notifications   Notification[] @relation("recipient")
+  notified        Notification[] @relation("actor")
+  readings        ReadingEntry[]
+}
+
+model Topic {
+  id           String    @id @default(cuid())
+  title        String    @default("") // optional: social posts are usually just text/quote
+  selftext     String    @default("")
+  book_title   String?
+  book_author  String?
+  hashtags     String[]
+  // Resenha: a post with a 0-5 star rating (then title, text and book are required). null = regular post.
+  rating       Int?
+  // Automatic "started/finished reading" post: "started" | "finished", null = regular post.
+  // Text is written by the API and these posts don't count toward the free daily quota.
+  reading_event String?
+  created_at   DateTime  @default(now())
+
+  author       User      @relation(fields: [author_username], references: [username])
+  author_username String
+
+  comments     Comment[]
+
+  // null = post do feed geral; set = tópico dentro de uma comunidade
+  community    Community? @relation(fields: [community_id], references: [id], onDelete: Cascade)
+  community_id String?
+
+  // "Citar": this post quotes another one. SetNull so deleting the original keeps the quote.
+  quoted       Topic?    @relation("quotes", fields: [quoted_id], references: [id], onDelete: SetNull)
+  quoted_id    String?
+  quoted_by    Topic[]   @relation("quotes")
+
+  likes         TopicLike[]
+  notifications Notification[]
+
+  @@index([author_username])
+  @@index([community_id])
+  @@index([book_title])
+}
+
+model Community {
+  id          String    @id @default(cuid())
+  title       String
+  description String    @default("")
+  created_at  DateTime  @default(now())
+
+  owner       User      @relation(fields: [owner_username], references: [username])
+  owner_username String
+
+  // Cover/banner picked by the owner. cover_updated_at versions the URL so clients refetch.
+  cover_data         Bytes?
+  cover_content_type String?
+  cover_updated_at   DateTime?
+
+  topics      Topic[]
+  members     CommunityMember[]
+}
+
+// Who "faz parte" of a community. The owner is added as a member on creation.
+model CommunityMember {
+  community    Community @relation(fields: [community_id], references: [id], onDelete: Cascade)
+  community_id String
+
+  user         User      @relation(fields: [username], references: [username], onDelete: Cascade)
+  username     String
+
+  joined_at    DateTime  @default(now())
+
+  @@id([community_id, username])
+  @@index([username])
+}
+
+model Comment {
+  id          Int       @id @default(autoincrement())
+  body        String
+  created_at  DateTime  @default(now())
+
+  topic       Topic     @relation(fields: [topic_id], references: [id], onDelete: Cascade)
+  topic_id    String
+
+  author      User      @relation(fields: [author_username], references: [username])
+  author_username String
+
+  parent      Comment?  @relation("replies", fields: [parent_id], references: [id], onDelete: Cascade)
+  parent_id   Int?
+  replies     Comment[] @relation("replies")
+  likes       CommentLike[]
+
+  @@index([topic_id])
+  @@index([author_username])
+  @@index([parent_id])
+}
+
+model Following {
+  follower          User     @relation("follower", fields: [follower_username], references: [username])
+  follower_username String
+
+  followed          User     @relation("followed", fields: [followed_username], references: [username])
+  followed_username String
+
+  last_active String @default("")
+  followed_at DateTime @default(now())
+
+  @@id([follower_username, followed_username])
+  @@index([followed_username])
+}
+
+model TopicLike {
+  topic      Topic    @relation(fields: [topic_id], references: [id], onDelete: Cascade)
+  topic_id   String
+  user       User     @relation(fields: [username], references: [username], onDelete: Cascade)
+  username   String
+  created_at DateTime @default(now())
+
+  @@id([topic_id, username])
+}
+
+model CommentLike {
+  comment    Comment  @relation(fields: [comment_id], references: [id], onDelete: Cascade)
+  comment_id Int
+  user       User     @relation(fields: [username], references: [username], onDelete: Cascade)
+  username   String
+  created_at DateTime @default(now())
+
+  @@id([comment_id, username])
+}
+
+// type: like | comment | reply | follow | mention | comment_like
+model Notification {
+  id                 Int      @id @default(autoincrement())
+  type               String
+  read               Boolean  @default(false)
+  created_at         DateTime @default(now())
+
+  recipient          User     @relation("recipient", fields: [recipient_username], references: [username], onDelete: Cascade)
+  recipient_username String
+  actor              User     @relation("actor", fields: [actor_username], references: [username], onDelete: Cascade)
+  actor_username     String
+  topic              Topic?   @relation(fields: [topic_id], references: [id], onDelete: Cascade)
+  topic_id           String?
+
+  @@index([recipient_username, created_at])
+}
+
+// A user's shelf: one row per book, pushed by the plugin while reading.
+// status: reading | finished
+model ReadingEntry {
+  user        User     @relation(fields: [username], references: [username], onDelete: Cascade)
+  username    String
+  book_title  String
+  book_author String   @default("")
+  progress    Int      @default(0) // percent
+  status      String   @default("reading")
+  started_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  @@id([username, book_title])
+  @@index([book_title])
+}
+
+// One cover per book title, uploaded by the plugin (extracted from the open ebook) the
+// first time someone posts about it; every post about that book shows it.
+model BookCover {
+  book_title   String   @id
+  data         Bytes
+  content_type String   @default("image/jpeg")
+  updated_at   DateTime @updatedAt
+}

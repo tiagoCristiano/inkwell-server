@@ -1,0 +1,1250 @@
+require("dotenv/config");
+const express = require("express");
+const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
+const { PrismaClient } = require("@prisma/client");
+
+const JWT_SECRET = process.env.JWT_SECRET || "mock-secret-change-me"; // set JWT_SECRET in prod or anyone can forge admin tokens
+const PORT = process.env.PORT || 3001;
+
+// Image bytes are only loaded by the routes that serve them (omit: { cover_data: false }).
+const prisma = new PrismaClient({ omit: { community: { cover_data: true } } });
+const app = express();
+app.use(express.json({ limit: "10mb" })); // avatars arrive as base64 in the JSON body
+
+const ROLE_RANK = { user: 0, moderator: 1, admin: 2 };
+
+function authMiddleware(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token) {
+    return res.status(401).json({ error: "Missing bearer token" });
+  }
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
+// Requires the caller's role rank to be at least minRole's rank.
+function requireRole(minRole) {
+  return (req, res, next) => {
+    if (ROLE_RANK[req.user.role] >= ROLE_RANK[minRole]) {
+      return next();
+    }
+    return res.status(403).json({ error: "Forbidden: insufficient role" });
+  };
+}
+
+// Whether actorUsername may delete/edit content authored by targetUsername:
+// - admins can moderate everyone, including other admins and moderators.
+// - moderators can moderate regular users only (not admins, not other moderators).
+// - everyone can always act on their own content.
+function canModerate(actorRole, actorUsername, targetRole, targetUsername) {
+  if (actorUsername === targetUsername) return true;
+  if (actorRole === "admin") return true;
+  if (actorRole === "moderator") return targetRole === "user";
+  return false;
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  return `${salt}:${crypto.scryptSync(password, salt, 64).toString("hex")}`;
+}
+
+// ponytail: plaintext fallback only for rows seeded before hashing; drop after a reseed.
+function verifyPassword(password, stored) {
+  const [salt, hash] = stored.split(":");
+  if (!hash) return password === stored;
+  const actual = crypto.scryptSync(password, salt, 64);
+  const expected = Buffer.from(hash, "hex");
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+function issueSession(res, user, status = 200) {
+  // ponytail: no expiry so the Kindle stays logged in; add refresh tokens + revocation for the real API.
+  const token = jwt.sign({ sub: user.username, role: user.role }, JWT_SECRET);
+  res.status(status).json({ token, username: user.username, role: user.role });
+}
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MIN_PASSWORD_LENGTH = 6;
+
+app.post("/auth/login", async (req, res) => {
+  const email = (req.body?.email || "").trim().toLowerCase();
+  const password = req.body?.password || "";
+  if (!email || !password) {
+    return res.status(400).json({ error: "Informe email e senha" });
+  }
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (!user || !verifyPassword(password, user.password)) {
+    return res.status(401).json({ error: "Email ou senha inválidos" });
+  }
+  if (!user.password.includes(":")) {
+    await prisma.user.update({ where: { username: user.username }, data: { password: hashPassword(password) } });
+  }
+  issueSession(res, user);
+});
+
+// Shared by self-service sign-up and admin-created moderators. The @handle is derived
+// from the email's local part (made unique with a numeric suffix); the user can change
+// their display name later in the profile. Returns { user } or { status, error }.
+async function createAccount(rawEmail, password, role) {
+  const email = (rawEmail || "").trim().toLowerCase();
+  if (!EMAIL_RE.test(email)) {
+    return { status: 400, error: "Email inválido" };
+  }
+  if ((password || "").length < MIN_PASSWORD_LENGTH) {
+    return { status: 400, error: `A senha precisa ter pelo menos ${MIN_PASSWORD_LENGTH} caracteres` };
+  }
+  if (await prisma.user.findUnique({ where: { email } })) {
+    return { status: 409, error: "Já existe uma conta com esse email" };
+  }
+  const base = email.split("@")[0].replace(/[^a-z0-9_]/g, "").slice(0, 20) || "leitor";
+  let username = base;
+  for (let n = 2; await prisma.user.findUnique({ where: { username } }); n++) {
+    username = `${base}${n}`;
+  }
+  const user = await prisma.user.create({
+    data: { username, email, password: hashPassword(password), role, display_name: username },
+  });
+  return { user };
+}
+
+app.post("/auth/register", async (req, res) => {
+  const { user, status, error } = await createAccount(req.body?.email, req.body?.password, "user");
+  if (error) return res.status(status).json({ error });
+  issueSession(res, user, 201);
+});
+
+// Admin-only: create a new moderator account.
+app.post("/admin/users", authMiddleware, requireRole("admin"), async (req, res) => {
+  const { user, status, error } = await createAccount(req.body?.email, req.body?.password, "moderator");
+  if (error) return res.status(status).json({ error });
+  res.status(201).json({ username: user.username, role: user.role });
+});
+
+// ---------------------------------------------------------------------------
+// Serialization
+// ---------------------------------------------------------------------------
+
+// avatar_content_type is set together with avatar_data, so it tells us whether there's
+// an avatar without loading the image bytes for every author in a feed page.
+const AUTHOR_SELECT = { username: true, display_name: true, avatar_content_type: true };
+
+function avatarUrl(req, username, hasAvatar) {
+  if (!hasAvatar) return null;
+  return `${req.protocol}://${req.get("host")}/avatars/${encodeURIComponent(username)}`;
+}
+
+function avatarUrlFor(req, user) {
+  return user ? avatarUrl(req, user.username, user.avatar_content_type || user.avatar_data) : null;
+}
+
+function userCard(req, user, extra = {}) {
+  return {
+    username: user.username,
+    display_name: user.display_name,
+    bio: user.bio,
+    avatar_url: avatarUrlFor(req, user),
+    ...extra,
+  };
+}
+
+const EXCERPT_LEN = 280;
+const excerpt = (text) => (text.length > EXCERPT_LEN ? `${text.slice(0, EXCERPT_LEN)}…` : text);
+
+// Everything a feed card needs, including whether the caller liked it.
+function summaryInclude(me) {
+  return {
+    _count: { select: { comments: true, likes: true } },
+    likes: { where: { username: me }, select: { username: true } },
+    author: { select: AUTHOR_SELECT },
+    community: { select: { id: true, title: true, owner_username: true } },
+    quoted: { include: { author: { select: AUTHOR_SELECT } } },
+  };
+}
+
+function topicSummary(req, t) {
+  return {
+    id: t.id,
+    title: t.title,
+    selftext: excerpt(t.selftext),
+    author: t.author_username,
+    author_display_name: t.author?.display_name,
+    author_avatar_url: avatarUrlFor(req, t.author),
+    book_title: t.book_title,
+    book_author: t.book_author,
+    hashtags: t.hashtags,
+    rating: t.rating,
+    num_comments: t._count.comments,
+    num_likes: t._count.likes,
+    liked: t.likes.length > 0,
+    created_at: t.created_at.toISOString(),
+    community: t.community ? { id: t.community.id, title: t.community.title, owner: t.community.owner_username } : null,
+    quoted: t.quoted
+      ? {
+          id: t.quoted.id,
+          author: t.quoted.author_username,
+          author_display_name: t.quoted.author?.display_name,
+          title: t.quoted.title,
+          selftext: excerpt(t.quoted.selftext),
+        }
+      : null,
+  };
+}
+
+function fullInclude(me) {
+  return {
+    ...summaryInclude(me),
+    comments: {
+      orderBy: { created_at: "asc" },
+      include: {
+        author: { select: AUTHOR_SELECT },
+        _count: { select: { likes: true } },
+        likes: { where: { username: me }, select: { username: true } },
+      },
+    },
+  };
+}
+
+function serializeTopic(req, t) {
+  return {
+    ...topicSummary(req, t),
+    selftext: t.selftext,
+    comments: t.comments.map((c) => ({
+      id: c.id,
+      parent_id: c.parent_id,
+      author: c.author_username,
+      author_display_name: c.author?.display_name,
+      body: c.body,
+      num_likes: c._count.likes,
+      liked: c.likes.length > 0,
+      created_at: c.created_at.toISOString(),
+    })),
+  };
+}
+
+function coverUrl(req, title) {
+  return `${req.protocol}://${req.get("host")}/covers?title=${encodeURIComponent(title)}`;
+}
+
+// Sets book_cover_url on each topic whose book has an uploaded cover (one query per page).
+async function attachCovers(req, topics) {
+  const titles = [...new Set(topics.map((t) => t.book_title).filter(Boolean))];
+  if (titles.length === 0) return topics;
+  const covers = await prisma.bookCover.findMany({ where: { book_title: { in: titles } }, select: { book_title: true } });
+  const has = new Set(covers.map((c) => c.book_title));
+  for (const t of topics) t.book_cover_url = has.has(t.book_title) ? coverUrl(req, t.book_title) : null;
+  return topics;
+}
+
+async function loadFullTopic(req, id) {
+  const topic = await prisma.topic.findUnique({ where: { id }, include: fullInclude(req.user.sub) });
+  return topic && (await attachCovers(req, [serializeTopic(req, topic)]))[0];
+}
+
+async function listSummaries(req, where, { skip, take } = {}) {
+  const topics = await prisma.topic.findMany({
+    where,
+    skip,
+    take,
+    orderBy: { created_at: "desc" },
+    include: summaryInclude(req.user.sub),
+  });
+  return attachCovers(req, topics.map((t) => topicSummary(req, t)));
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+async function notify(recipient, actor, type, topicId = null) {
+  if (!recipient || recipient === actor) return;
+  await prisma.notification.create({
+    data: { recipient_username: recipient, actor_username: actor, type, topic_id: topicId },
+  });
+}
+
+// "@alice" in a post/comment notifies alice (if she exists). skip = already notified otherwise.
+async function notifyMentions(text, actor, topicId, skip = []) {
+  const names = [...new Set([...(text || "").matchAll(/@([a-z0-9_]+)/gi)].map((m) => m[1].toLowerCase()))]
+    .filter((n) => !skip.includes(n));
+  if (names.length === 0) return;
+  const users = await prisma.user.findMany({ where: { username: { in: names } }, select: { username: true } });
+  for (const u of users) await notify(u.username, actor, "mention", topicId);
+}
+
+const unreadCount = (username) => prisma.notification.count({ where: { recipient_username: username, read: false } });
+
+// ---------------------------------------------------------------------------
+// Topics / feed
+// ---------------------------------------------------------------------------
+
+async function followedUsernames(username) {
+  const rows = await prisma.following.findMany({
+    where: { follower_username: username },
+    select: { followed_username: true },
+  });
+  return rows.map((r) => r.followed_username);
+}
+
+// feed=following: posts by people you follow (plus your own); feed=reviews: every resenha; anything else: everyone.
+app.get("/topics", authMiddleware, async (req, res) => {
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 2, 1), 50);
+  const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+  const where = { community_id: null };
+  if (req.query.feed === "following") {
+    where.author_username = { in: [...(await followedUsernames(req.user.sub)), req.user.sub] };
+  } else if (req.query.feed === "reviews") {
+    where.rating = { not: null };
+  }
+  const [topics, total, unread] = await Promise.all([
+    listSummaries(req, where, { skip: offset, take: limit }),
+    prisma.topic.count({ where }),
+    unreadCount(req.user.sub),
+  ]);
+  res.json({ topics, offset, limit, total, has_more: offset + topics.length < total, unread_notifications: unread });
+});
+
+// q: "@alice" = by author, "#tag" = by hashtag, anything else = text in title/body.
+app.get("/topics/search", authMiddleware, async (req, res) => {
+  const raw = (req.query.q || "").trim();
+  let where;
+  if (raw.startsWith("@")) {
+    where = { author_username: { startsWith: raw.slice(1).toLowerCase(), mode: "insensitive" } };
+  } else if (raw.startsWith("#")) {
+    where = { hashtags: { has: raw.slice(1).toLowerCase() } };
+  } else {
+    where = {
+      OR: [
+        { title: { contains: raw, mode: "insensitive" } },
+        { selftext: { contains: raw, mode: "insensitive" } },
+        { book_title: { contains: raw, mode: "insensitive" } },
+      ],
+    };
+  }
+  res.json({ topics: await listSummaries(req, where, { take: 50 }) });
+});
+
+app.get("/topics/:id", authMiddleware, async (req, res) => {
+  const topic = await loadFullTopic(req, req.params.id);
+  if (!topic) {
+    return res.status(404).json({ error: "Topic not found" });
+  }
+  res.json({ topic });
+});
+
+app.post("/topics/:id/comments", authMiddleware, async (req, res) => {
+  const topic = await prisma.topic.findUnique({ where: { id: req.params.id } });
+  if (!topic) {
+    return res.status(404).json({ error: "Topic not found" });
+  }
+  const { body, parent_id } = req.body || {};
+  if (!body) {
+    return res.status(400).json({ error: "body is required" });
+  }
+  let parent = null;
+  if (parent_id != null) {
+    parent = await prisma.comment.findFirst({ where: { id: parent_id, topic_id: topic.id } });
+    if (!parent) {
+      return res.status(400).json({ error: "parent_id does not exist on this topic" });
+    }
+  }
+  // Replies are one level deep (social style): a reply to a reply hangs off the top-level comment.
+  const rootId = parent ? parent.parent_id ?? parent.id : null;
+  await prisma.comment.create({
+    data: { body, parent_id: rootId, author_username: req.user.sub, topic_id: topic.id },
+  });
+  await notify(topic.author_username, req.user.sub, "comment", topic.id);
+  if (parent && parent.author_username !== topic.author_username) {
+    await notify(parent.author_username, req.user.sub, "reply", topic.id);
+  }
+  await notifyMentions(body, req.user.sub, topic.id, [topic.author_username, parent?.author_username]);
+  res.status(201).json({ topic: await loadFullTopic(req, topic.id) });
+});
+
+app.delete("/topics/:id", authMiddleware, async (req, res) => {
+  const topic = await prisma.topic.findUnique({ where: { id: req.params.id }, include: { community: true } });
+  if (!topic) {
+    return res.status(404).json({ error: "Topic not found" });
+  }
+  const author = await prisma.user.findUnique({ where: { username: topic.author_username } });
+  const isCommunityOwner = topic.community?.owner_username === req.user.sub;
+  if (!isCommunityOwner && !canModerate(req.user.role, req.user.sub, author.role, topic.author_username)) {
+    return res.status(403).json({ error: "Forbidden: cannot moderate this author" });
+  }
+  await prisma.topic.delete({ where: { id: topic.id } });
+  res.status(204).end();
+});
+
+app.put("/topics/:id", authMiddleware, async (req, res) => {
+  const topic = await prisma.topic.findUnique({ where: { id: req.params.id } });
+  if (!topic) {
+    return res.status(404).json({ error: "Topic not found" });
+  }
+  const author = await prisma.user.findUnique({ where: { username: topic.author_username } });
+  if (!canModerate(req.user.role, req.user.sub, author.role, topic.author_username)) {
+    return res.status(403).json({ error: "Forbidden: cannot edit this author's content" });
+  }
+  const { title, selftext } = req.body || {};
+  await prisma.topic.update({
+    where: { id: topic.id },
+    data: {
+      ...(typeof title === "string" ? { title } : {}),
+      ...(typeof selftext === "string" ? { selftext } : {}),
+    },
+  });
+  res.json({ topic: await loadFullTopic(req, topic.id) });
+});
+
+app.delete("/topics/:id/comments/:commentId", authMiddleware, async (req, res) => {
+  const topic = await prisma.topic.findUnique({ where: { id: req.params.id } });
+  if (!topic) {
+    return res.status(404).json({ error: "Topic not found" });
+  }
+  const commentId = parseInt(req.params.commentId, 10);
+  const comment = await prisma.comment.findFirst({ where: { id: commentId, topic_id: topic.id } });
+  if (!comment) {
+    return res.status(404).json({ error: "Comment not found" });
+  }
+  const author = await prisma.user.findUnique({ where: { username: comment.author_username } });
+  if (!canModerate(req.user.role, req.user.sub, author.role, comment.author_username)) {
+    return res.status(403).json({ error: "Forbidden: cannot moderate this author" });
+  }
+  // onDelete: Cascade on Comment.parent_id handles cascading to replies (and their replies).
+  await prisma.comment.delete({ where: { id: commentId } });
+  res.json({ topic: await loadFullTopic(req, topic.id) });
+});
+
+// A post needs at least some text (title is optional now), or to be a quote of another post.
+// ---------------------------------------------------------------------------
+// Plans: free users have quotas, premium users (User.premium) have none.
+// The API is the only place these rules live; clients just show the error message.
+// ---------------------------------------------------------------------------
+
+const FREE_LIMITS = {
+  feedPostsPerDay: 3, // posts outside communities (incl. reviews and quotes), rolling 24h; reading posts don't count
+  communities: 1, // communities owned
+  topicsPerCommunity: 1, // topics created inside each community
+};
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// 402 (not 403) so clients show the message instead of a generic "forbidden".
+class QuotaError extends Error {}
+
+// Runs fn(tx) holding a per-user lock, so concurrent requests can't both pass a quota
+// check before either one's insert lands. The lock is released when the transaction ends.
+function withUserLock(username, fn) {
+  return prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${username}))`;
+    return fn(tx);
+  });
+}
+
+function planUser(tx, username) {
+  return tx.user.findUnique({ where: { username }, select: { premium: true, post_quota_reset_at: true } });
+}
+
+// Feed posts counted against the free daily quota: the last 24h, but only since the last
+// admin reset (POST /admin/reset-post-quotas). Shared by enforcement and GET /me/plan.
+function feedPostsUsed(tx, username, user) {
+  const dayAgo = new Date(Date.now() - DAY_MS);
+  const since = user.post_quota_reset_at > dayAgo ? user.post_quota_reset_at : dayAgo;
+  return tx.topic.count({
+    where: { author_username: username, community_id: null, reading_event: null, created_at: { gt: since } },
+  });
+}
+
+async function assertCanPost(tx, username, communityId) {
+  const user = await planUser(tx, username);
+  if (user.premium) return;
+  if (communityId) {
+    const count = await tx.topic.count({ where: { author_username: username, community_id: communityId } });
+    if (count >= FREE_LIMITS.topicsPerCommunity) {
+      throw new QuotaError("No plano gratuito você pode criar 1 tópico por comunidade. Seja premium para postar sem limites.");
+    }
+    return;
+  }
+  if ((await feedPostsUsed(tx, username, user)) >= FREE_LIMITS.feedPostsPerDay) {
+    throw new QuotaError(
+      `No plano gratuito você pode publicar ${FREE_LIMITS.feedPostsPerDay} posts por dia. Seja premium para postar sem limites.`,
+    );
+  }
+}
+
+async function assertCanCreateCommunity(tx, username) {
+  if ((await planUser(tx, username)).premium) return;
+  if ((await tx.community.count({ where: { owner_username: username } })) >= FREE_LIMITS.communities) {
+    throw new QuotaError("No plano gratuito você pode criar 1 comunidade. Seja premium para criar sem limites.");
+  }
+}
+
+// The caller's plan, the free-plan limits and how much of them is used, for the plans screen.
+app.get("/me/plan", authMiddleware, async (req, res) => {
+  const username = req.user.sub;
+  const user = await planUser(prisma, username);
+  const [feed_posts_today, communities] = await Promise.all([
+    feedPostsUsed(prisma, username, user),
+    prisma.community.count({ where: { owner_username: username } }),
+  ]);
+  res.json({
+    premium: user.premium,
+    free_limits: {
+      feed_posts_per_day: FREE_LIMITS.feedPostsPerDay,
+      communities: FREE_LIMITS.communities,
+      topics_per_community: FREE_LIMITS.topicsPerCommunity,
+    },
+    usage: { feed_posts_today, communities },
+  });
+});
+
+// Gives every user a fresh daily feed-post balance (posts before now stop counting).
+app.post("/admin/reset-post-quotas", authMiddleware, requireRole("admin"), async (req, res) => {
+  const { count } = await prisma.user.updateMany({ data: { post_quota_reset_at: new Date() } });
+  res.json({ users: count });
+});
+
+// Automatic reading posts, written here (not by the client) so a quota-free post can't
+// carry arbitrary content. lang is the client's UI language.
+const READING_POSTS = {
+  en: { started: "I started reading %s.", finished: "I finished reading %s.", by: "%s, by %s", tag: { started: "reading", finished: "read" } },
+  pt_BR: { started: "Comecei a ler %s.", finished: "Terminei de ler %s.", by: "%s, de %s", tag: { started: "lendo", finished: "lido" } },
+};
+
+// Validates a reading post against the user's shelf and returns { fields } or { error }.
+// Allowed once per book and event: "started" needs the book on the shelf, "finished" needs it finished.
+async function readingPost(tx, username, book_title, event, lang) {
+  const texts = READING_POSTS[lang] || READING_POSTS.en;
+  if (!texts[event]) return { error: "reading_event must be started or finished" };
+  const entry = await tx.readingEntry.findUnique({ where: { username_book_title: { username, book_title } } });
+  if (!entry || (event === "finished" && entry.status !== "finished")) {
+    return { error: "Livro não está na sua estante com esse status" };
+  }
+  if (await tx.topic.count({ where: { author_username: username, book_title, reading_event: event } })) {
+    return { error: "Essa leitura já foi compartilhada" };
+  }
+  const book = entry.book_author ? texts.by.replace("%s", book_title).replace("%s", entry.book_author) : book_title;
+  return {
+    fields: {
+      selftext: texts[event].replace("%s", book),
+      book_title,
+      book_author: entry.book_author || null,
+      hashtags: [texts.tag[event]],
+      reading_event: event,
+    },
+  };
+}
+
+// cover: { data: "<base64>", content_type } extracted by the plugin from the open ebook.
+async function saveBookCover(book_title, cover) {
+  if (!book_title || typeof cover?.data !== "string" || !cover.data) return;
+  const data = Buffer.from(cover.data, "base64");
+  if (data.length === 0) return;
+  const content_type = cover.content_type || "image/jpeg";
+  await prisma.bookCover.upsert({
+    where: { book_title },
+    create: { book_title, data, content_type },
+    update: { data, content_type },
+  });
+}
+
+// Body: { reading_event, book_title, lang, cover }. Anything else the client sends is ignored.
+async function createReadingPost(req, res) {
+  const book_title = (req.body.book_title || "").trim();
+  if (!book_title) return res.status(400).json({ error: "book_title is required" });
+  // Same per-user lock as the quotas: two racing requests can't both share one event.
+  const result = await withUserLock(req.user.sub, async (tx) => {
+    const built = await readingPost(tx, req.user.sub, book_title, req.body.reading_event, req.body.lang);
+    if (built.error) return built;
+    return { topic: await tx.topic.create({ data: { ...built.fields, author_username: req.user.sub } }) };
+  });
+  if (result.error) return res.status(400).json({ error: result.error });
+  await saveBookCover(book_title, req.body.cover);
+  res.status(201).json({ topic: await loadFullTopic(req, result.topic.id) });
+}
+
+function sendQuotaError(res, err) {
+  if (!(err instanceof QuotaError)) throw err;
+  res.status(402).json({ error: err.message, code: "premium_required" });
+}
+
+app.post("/topics", authMiddleware, async (req, res) => {
+  if (req.body?.reading_event != null) return createReadingPost(req, res);
+  const { title, selftext, book_title, book_author, hashtags, community_id, quoted_id, cover, rating } = req.body || {};
+  if (!title && !selftext && !quoted_id) {
+    return res.status(400).json({ error: "Escreva algo para publicar" });
+  }
+  if (rating != null) {
+    if (!Number.isInteger(rating) || rating < 0 || rating > 5) {
+      return res.status(400).json({ error: "A nota deve ser de 0 a 5" });
+    }
+    if (!title || !selftext || !book_title) {
+      return res.status(400).json({ error: "Resenha precisa de livro, título e texto" });
+    }
+  }
+  if (community_id != null && !(await prisma.community.findUnique({ where: { id: community_id } }))) {
+    return res.status(400).json({ error: "community_id does not exist" });
+  }
+  const quoted = quoted_id ? await prisma.topic.findUnique({ where: { id: quoted_id } }) : null;
+  if (quoted_id && !quoted) {
+    return res.status(400).json({ error: "quoted_id does not exist" });
+  }
+  let topic;
+  try {
+    topic = await withUserLock(req.user.sub, async (tx) => {
+      await assertCanPost(tx, req.user.sub, community_id || null);
+      return tx.topic.create({
+        data: {
+          title: title || "",
+          selftext: selftext || "",
+          book_title: book_title || quoted?.book_title || null,
+          book_author: book_author || quoted?.book_author || null,
+          hashtags: Array.isArray(hashtags) ? hashtags.map((h) => String(h).toLowerCase()) : [],
+          author_username: req.user.sub,
+          community_id: community_id || null,
+          quoted_id: quoted?.id || null,
+          rating: rating ?? null,
+        },
+      });
+    });
+  } catch (err) {
+    return sendQuotaError(res, err);
+  }
+  await saveBookCover(topic.book_title, cover);
+  if (quoted) await notify(quoted.author_username, req.user.sub, "quote", topic.id);
+  await notifyMentions(`${title || ""} ${selftext || ""}`, req.user.sub, topic.id, [quoted?.author_username]);
+  res.status(201).json({ topic: await loadFullTopic(req, topic.id) });
+});
+
+// ---------------------------------------------------------------------------
+// Likes
+// ---------------------------------------------------------------------------
+
+// Idempotent like/unlike; returns the fresh count so the client can just redraw.
+async function setLike(model, where, data, liking) {
+  if (!liking) {
+    await model.deleteMany({ where: data });
+    return false;
+  }
+  const existing = await model.findUnique({ where });
+  if (!existing) await model.create({ data });
+  return !existing; // newly liked
+}
+
+for (const method of ["post", "delete"]) {
+  app[method]("/topics/:id/like", authMiddleware, async (req, res) => {
+    const topic = await prisma.topic.findUnique({ where: { id: req.params.id } });
+    if (!topic) return res.status(404).json({ error: "Topic not found" });
+    const data = { topic_id: topic.id, username: req.user.sub };
+    const isNew = await setLike(prisma.topicLike, { topic_id_username: data }, data, method === "post");
+    if (isNew) await notify(topic.author_username, req.user.sub, "like", topic.id);
+    const num_likes = await prisma.topicLike.count({ where: { topic_id: topic.id } });
+    res.json({ liked: method === "post", num_likes });
+  });
+
+  app[method]("/comments/:id/like", authMiddleware, async (req, res) => {
+    const comment = await prisma.comment.findUnique({ where: { id: parseInt(req.params.id, 10) || 0 } });
+    if (!comment) return res.status(404).json({ error: "Comment not found" });
+    const data = { comment_id: comment.id, username: req.user.sub };
+    const isNew = await setLike(prisma.commentLike, { comment_id_username: data }, data, method === "post");
+    if (isNew) await notify(comment.author_username, req.user.sub, "comment_like", comment.topic_id);
+    const num_likes = await prisma.commentLike.count({ where: { comment_id: comment.id } });
+    res.json({ liked: method === "post", num_likes });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Communities
+// ---------------------------------------------------------------------------
+
+// Expects c loaded with communityInclude(username).
+function communitySummary(req, c) {
+  return {
+    id: c.id,
+    cover_url: c.cover_updated_at
+      ? `${req.protocol}://${req.get("host")}/communities/${c.id}/cover?v=${c.cover_updated_at.getTime()}`
+      : null,
+    title: c.title,
+    description: c.description,
+    owner: c.owner_username,
+    num_topics: c._count.topics,
+    num_members: c._count.members,
+    is_member: c.members.length > 0,
+    created_at: c.created_at.toISOString(),
+  };
+}
+
+// Counts, plus the caller's own membership row (if any) for is_member.
+function communityInclude(username) {
+  return {
+    _count: { select: { topics: true, members: true } },
+    members: { where: { username }, select: { username: true } },
+  };
+}
+
+// ponytail: no pagination, add offset/limit like /topics once there are many communities.
+app.get("/communities", authMiddleware, async (req, res) => {
+  const communities = await prisma.community.findMany({
+    orderBy: { title: "asc" },
+    include: communityInclude(req.user.sub),
+  });
+  res.json({ communities: communities.map((c) => communitySummary(req, c)) });
+});
+
+app.post("/communities", authMiddleware, async (req, res) => {
+  const title = (req.body?.title || "").trim();
+  const description = (req.body?.description || "").trim();
+  if (!title) {
+    return res.status(400).json({ error: "Informe o título da comunidade" });
+  }
+  let community;
+  try {
+    community = await withUserLock(req.user.sub, async (tx) => {
+      await assertCanCreateCommunity(tx, req.user.sub);
+      return tx.community.create({
+        data: {
+          title,
+          description,
+          owner_username: req.user.sub,
+          members: { create: { username: req.user.sub } },
+        },
+        include: communityInclude(req.user.sub),
+      });
+    });
+  } catch (err) {
+    return sendQuotaError(res, err);
+  }
+  res.status(201).json({ community: { ...communitySummary(req, community), topics: [] } });
+});
+
+app.get("/communities/:id", authMiddleware, async (req, res) => {
+  const community = await prisma.community.findUnique({
+    where: { id: req.params.id },
+    include: communityInclude(req.user.sub),
+  });
+  if (!community) {
+    return res.status(404).json({ error: "Comunidade não encontrada" });
+  }
+  const topics = await listSummaries(req, { community_id: community.id });
+  res.json({ community: { ...communitySummary(req, community), topics } });
+});
+
+// Owner-only. Body: { data: "<base64>", content_type }. Replaces any existing cover.
+app.put("/communities/:id/cover", authMiddleware, async (req, res) => {
+  const community = await prisma.community.findUnique({ where: { id: req.params.id } });
+  if (!community) {
+    return res.status(404).json({ error: "Comunidade não encontrada" });
+  }
+  if (community.owner_username !== req.user.sub) {
+    return res.status(403).json({ error: "Só o dono pode trocar a capa" });
+  }
+  const { data, content_type } = req.body || {};
+  const buffer = typeof data === "string" ? Buffer.from(data, "base64") : Buffer.alloc(0);
+  if (buffer.length === 0) {
+    return res.status(400).json({ error: "data (base64) is required" });
+  }
+  const updated = await prisma.community.update({
+    where: { id: community.id },
+    data: { cover_data: buffer, cover_content_type: content_type || "image/jpeg", cover_updated_at: new Date() },
+    include: communityInclude(req.user.sub),
+  });
+  res.json({ community: communitySummary(req, updated) });
+});
+
+// Public like avatars and book covers: the plugin's image downloader sends no token.
+app.get("/communities/:id/cover", async (req, res) => {
+  const community = await prisma.community.findUnique({ where: { id: req.params.id }, omit: { cover_data: false } });
+  if (!community?.cover_data) {
+    return res.status(404).json({ error: "No cover" });
+  }
+  res.set("Content-Type", community.cover_content_type || "image/jpeg");
+  res.send(community.cover_data);
+});
+
+app.post("/communities/:id/members", authMiddleware, async (req, res) => {
+  const where = { community_id_username: { community_id: req.params.id, username: req.user.sub } };
+  if (!(await prisma.community.findUnique({ where: { id: req.params.id } }))) {
+    return res.status(404).json({ error: "Comunidade não encontrada" });
+  }
+  await prisma.communityMember.upsert({ where, create: where.community_id_username, update: {} });
+  res.status(204).end();
+});
+
+// Leave. The owner can't leave their own community (it would be left without an owner member).
+app.delete("/communities/:id/members", authMiddleware, async (req, res) => {
+  const community = await prisma.community.findUnique({ where: { id: req.params.id } });
+  if (!community) {
+    return res.status(404).json({ error: "Comunidade não encontrada" });
+  }
+  if (community.owner_username === req.user.sub) {
+    return res.status(400).json({ error: "O dono não pode sair da própria comunidade" });
+  }
+  await prisma.communityMember.deleteMany({ where: { community_id: req.params.id, username: req.user.sub } });
+  res.status(204).end();
+});
+
+// ---------------------------------------------------------------------------
+// Me
+// ---------------------------------------------------------------------------
+
+app.get("/me/posts", authMiddleware, async (req, res) => {
+  res.json({ posts: await listSummaries(req, { author_username: req.user.sub }) });
+});
+
+function ownProfile(req, user) {
+  return {
+    username: user.username,
+    role: user.role,
+    display_name: user.display_name,
+    bio: user.bio,
+    gender: user.gender,
+    age: user.age,
+    is_public: user.is_public,
+    avatar_url: avatarUrlFor(req, user),
+  };
+}
+
+app.get("/me/profile", authMiddleware, async (req, res) => {
+  const user = await prisma.user.findUnique({ where: { username: req.user.sub } });
+  res.json({ profile: ownProfile(req, user) });
+});
+
+app.put("/me/profile", authMiddleware, async (req, res) => {
+  const { display_name, bio, gender, age, is_public } = req.body || {};
+  if (age != null && (!Number.isInteger(age) || age <= 18)) {
+    return res.status(400).json({ error: "Idade deve ser um número inteiro maior que 18" });
+  }
+  const user = await prisma.user.update({
+    where: { username: req.user.sub },
+    data: {
+      ...(typeof display_name === "string" ? { display_name } : {}),
+      ...(typeof bio === "string" ? { bio } : {}),
+      ...(gender === "masc" || gender === "feminino" || gender === "outro" ? { gender } : {}),
+      ...(typeof age === "number" ? { age } : {}),
+      ...(typeof is_public === "boolean" ? { is_public } : {}),
+    },
+  });
+  res.json({ profile: ownProfile(req, user) });
+});
+
+// Body: { data: "<base64>", content_type: "image/jpeg" }. Replaces any existing avatar.
+app.put("/me/avatar", authMiddleware, async (req, res) => {
+  const { data, content_type } = req.body || {};
+  if (typeof data !== "string" || !data) {
+    return res.status(400).json({ error: "data (base64) is required" });
+  }
+  let buffer;
+  try {
+    buffer = Buffer.from(data, "base64");
+  } catch (err) {
+    return res.status(400).json({ error: "data is not valid base64" });
+  }
+  if (buffer.length === 0) {
+    return res.status(400).json({ error: "decoded image is empty" });
+  }
+  const user = await prisma.user.update({
+    where: { username: req.user.sub },
+    data: { avatar_data: buffer, avatar_content_type: content_type || "image/jpeg" },
+  });
+  res.json({ avatar_url: avatarUrlFor(req, user) });
+});
+
+app.get("/me/notifications", authMiddleware, async (req, res) => {
+  const rows = await prisma.notification.findMany({
+    where: { recipient_username: req.user.sub },
+    orderBy: { created_at: "desc" },
+    take: 50,
+    include: {
+      actor: { select: AUTHOR_SELECT },
+      topic: { select: { title: true, selftext: true } },
+    },
+  });
+  res.json({
+    unread: rows.filter((n) => !n.read).length,
+    notifications: rows.map((n) => ({
+      id: n.id,
+      type: n.type,
+      read: n.read,
+      actor: n.actor_username,
+      actor_display_name: n.actor.display_name,
+      actor_avatar_url: avatarUrlFor(req, n.actor),
+      topic_id: n.topic_id,
+      topic_excerpt: n.topic ? (n.topic.title || n.topic.selftext).slice(0, 80) : null,
+      created_at: n.created_at.toISOString(),
+    })),
+  });
+});
+
+app.post("/me/notifications/read", authMiddleware, async (req, res) => {
+  await prisma.notification.updateMany({ where: { recipient_username: req.user.sub, read: false }, data: { read: true } });
+  res.status(204).end();
+});
+
+// The plugin pushes the book being read. Body: { book_title, book_author, progress (0-100), status? }.
+// Reaching 100% (or status "finished") marks it finished. Returns the entry plus what changed,
+// so the plugin can auto-post "começou"/"terminou" exactly once.
+app.put("/me/reading", authMiddleware, async (req, res) => {
+  const book_title = (req.body?.book_title || "").trim();
+  if (!book_title) return res.status(400).json({ error: "book_title is required" });
+  const progress = Math.min(Math.max(parseInt(req.body?.progress, 10) || 0, 0), 100);
+  const where = { username_book_title: { username: req.user.sub, book_title } };
+  const previous = await prisma.readingEntry.findUnique({ where });
+  const finished = req.body?.status === "finished" || progress >= 100 || previous?.status === "finished";
+  const data = {
+    book_author: (req.body?.book_author || previous?.book_author || "").trim(),
+    progress: finished ? 100 : progress,
+    status: finished ? "finished" : "reading",
+  };
+  const entry = await prisma.readingEntry.upsert({
+    where,
+    create: { username: req.user.sub, book_title, ...data },
+    update: data,
+  });
+  res.json({
+    entry: serializeReading(entry),
+    started: !previous,
+    finished_now: finished && previous?.status !== "finished",
+  });
+});
+
+function serializeReading(e) {
+  return {
+    book_title: e.book_title,
+    book_author: e.book_author,
+    progress: e.progress,
+    status: e.status,
+    updated_at: e.updated_at.toISOString(),
+  };
+}
+
+// Who to follow: people reading the same books first, then the most-followed.
+app.get("/me/suggestions", authMiddleware, async (req, res) => {
+  const me = req.user.sub;
+  const exclude = new Set([me, ...(await followedUsernames(me))]);
+  const myBooks = (await prisma.readingEntry.findMany({ where: { username: me }, select: { book_title: true } }))
+    .map((r) => r.book_title);
+
+  const picked = new Map(); // username -> reason
+  if (myBooks.length > 0) {
+    const sameBook = await prisma.readingEntry.findMany({
+      where: { book_title: { in: myBooks }, username: { notIn: [...exclude] } },
+      orderBy: { updated_at: "desc" },
+      take: 20,
+    });
+    for (const r of sameBook) if (!picked.has(r.username)) picked.set(r.username, `Também leu ${r.book_title}`);
+  }
+  const popular = await prisma.following.groupBy({
+    by: ["followed_username"],
+    where: { followed_username: { notIn: [...exclude] } },
+    _count: { follower_username: true },
+    orderBy: { _count: { follower_username: "desc" } },
+    take: 10,
+  });
+  for (const p of popular) if (!picked.has(p.followed_username)) picked.set(p.followed_username, "Popular no Inkwell");
+  if (picked.size < 10) {
+    const recent = await prisma.topic.findMany({
+      where: { author_username: { notIn: [...exclude, ...picked.keys()] } },
+      orderBy: { created_at: "desc" },
+      distinct: ["author_username"],
+      select: { author_username: true },
+      take: 10 - picked.size,
+    });
+    for (const r of recent) picked.set(r.author_username, "Postou recentemente");
+  }
+
+  const users = await prisma.user.findMany({ where: { username: { in: [...picked.keys()] } } });
+  const byName = new Map(users.map((u) => [u.username, u]));
+  res.json({
+    users: [...picked]
+      .filter(([username]) => byName.has(username))
+      .slice(0, 10)
+      .map(([username, reason]) => userCard(req, byName.get(username), { reason, followed_by_me: false })),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Users / follow
+// ---------------------------------------------------------------------------
+
+// Public like avatars: the plugin's image downloader sends no token.
+app.get("/covers", async (req, res) => {
+  const cover = await prisma.bookCover.findUnique({ where: { book_title: String(req.query.title || "") } });
+  if (!cover) return res.status(404).json({ error: "No cover" });
+  res.set("Content-Type", cover.content_type);
+  res.send(cover.data);
+});
+
+app.get("/avatars/:username", async (req, res) => {
+  const user = await prisma.user.findUnique({ where: { username: req.params.username } });
+  if (!user || !user.avatar_data) {
+    return res.status(404).json({ error: "No avatar set" });
+  }
+  res.set("Content-Type", user.avatar_content_type || "image/jpeg");
+  res.send(user.avatar_data);
+});
+
+for (const method of ["post", "delete"]) {
+  app[method]("/users/:username/follow", authMiddleware, async (req, res) => {
+    const target = req.params.username;
+    if (target === req.user.sub) return res.status(400).json({ error: "Você não pode seguir a si mesmo" });
+    if (!(await prisma.user.findUnique({ where: { username: target } }))) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    const data = { follower_username: req.user.sub, followed_username: target };
+    if (method === "delete") {
+      await prisma.following.deleteMany({ where: data });
+    } else if (!(await prisma.following.findUnique({ where: { follower_username_followed_username: data } }))) {
+      await prisma.following.create({ data });
+      await notify(target, req.user.sub, "follow");
+    }
+    const num_followers = await prisma.following.count({ where: { followed_username: target } });
+    res.json({ following: method === "post", num_followers });
+  });
+}
+
+// People lists (followers / following) with whether the caller follows each one.
+async function peopleList(req, usernames, extraByName = {}) {
+  const [users, mine] = await Promise.all([
+    prisma.user.findMany({ where: { username: { in: usernames } } }),
+    followedUsernames(req.user.sub),
+  ]);
+  const byName = new Map(users.map((u) => [u.username, u]));
+  return usernames
+    .filter((u) => byName.has(u))
+    .map((u) => userCard(req, byName.get(u), { followed_by_me: mine.includes(u), ...extraByName[u] }));
+}
+
+app.get("/users/:username/followers", authMiddleware, async (req, res) => {
+  const rows = await prisma.following.findMany({
+    where: { followed_username: req.params.username },
+    orderBy: { followed_at: "desc" },
+  });
+  res.json({ users: await peopleList(req, rows.map((r) => r.follower_username)) });
+});
+
+async function followingList(req, username) {
+  const rows = await prisma.following.findMany({
+    where: { follower_username: username },
+    orderBy: { followed_at: "desc" },
+  });
+  const extra = Object.fromEntries(rows.map((r) => [r.followed_username, { last_active: r.last_active }]));
+  return peopleList(req, rows.map((r) => r.followed_username), extra);
+}
+
+app.get("/users/:username/following", authMiddleware, async (req, res) => {
+  res.json({ users: await followingList(req, req.params.username) });
+});
+
+app.get("/me/following", authMiddleware, async (req, res) => {
+  res.json({ following: await followingList(req, req.user.sub) });
+});
+
+// Public profile: bio, counters, follow state, shelf and the latest posts.
+app.get("/users/:username", authMiddleware, async (req, res) => {
+  const username = req.params.username;
+  const me = req.user.sub;
+  const user = await prisma.user.findUnique({ where: { username } });
+  if (!user) {
+    return res.status(404).json({ error: "User not found" });
+  }
+
+  const [num_posts, num_followers, num_following, followRow, followsMeRow, recent_posts, readings] = await Promise.all([
+    prisma.topic.count({ where: { author_username: username } }),
+    prisma.following.count({ where: { followed_username: username } }),
+    prisma.following.count({ where: { follower_username: username } }),
+    prisma.following.findUnique({ where: { follower_username_followed_username: { follower_username: me, followed_username: username } } }),
+    prisma.following.findUnique({ where: { follower_username_followed_username: { follower_username: username, followed_username: me } } }),
+    listSummaries(req, { author_username: username }, { take: 20 }),
+    prisma.readingEntry.findMany({ where: { username }, orderBy: { updated_at: "desc" }, take: 30 }),
+  ]);
+
+  const isPublic = user.is_public !== false;
+  // Private profiles only show their shelf to themselves and their followers.
+  const showShelf = isPublic || username === me || !!followRow;
+  const shelf = showShelf ? readings.map(serializeReading) : [];
+  res.json({
+    profile: {
+      username: user.username,
+      display_name: user.display_name,
+      bio: user.bio,
+      role: user.role,
+      avatar_url: avatarUrlFor(req, user),
+      is_public: isPublic,
+      gender: isPublic ? user.gender : null,
+      age: isPublic ? user.age : null,
+      num_posts,
+      num_followers,
+      num_following,
+      followed_by_me: !!followRow,
+      follows_me: !!followsMeRow,
+      reading_now: shelf.find((r) => r.status === "reading") || null,
+      shelf,
+      recent_posts,
+    },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Books / trending
+// ---------------------------------------------------------------------------
+
+// Book page: everyone who has it on their shelf, plus every post about it.
+app.get("/books", authMiddleware, async (req, res) => {
+  const title = (req.query.title || "").trim();
+  if (!title) return res.status(400).json({ error: "title is required" });
+  const [entries, topics] = await Promise.all([
+    prisma.readingEntry.findMany({
+      where: { book_title: title },
+      orderBy: { updated_at: "desc" },
+      include: { user: { select: AUTHOR_SELECT } },
+      take: 50,
+    }),
+    listSummaries(req, { book_title: title }, { take: 50 }),
+  ]);
+  const author = entries.find((e) => e.book_author)?.book_author || topics.find((t) => t.book_author)?.book_author || "";
+  const cover = await prisma.bookCover.findUnique({ where: { book_title: title }, select: { book_title: true } });
+  res.json({
+    book: {
+      title,
+      author,
+      cover_url: cover ? coverUrl(req, title) : null,
+      readers: entries.map((e) => ({
+        username: e.username,
+        display_name: e.user.display_name,
+        avatar_url: avatarUrlFor(req, e.user),
+        status: e.status,
+        progress: e.progress,
+      })),
+      topics,
+    },
+  });
+});
+
+app.get("/trending", authMiddleware, async (req, res) => {
+  // ponytail: fixed 7-day window over all posts; precompute if the Topic table gets huge.
+  const [hashtags, books] = await Promise.all([
+    prisma.$queryRaw`
+      SELECT tag, COUNT(*)::int AS count FROM "Topic", unnest(hashtags) AS tag
+      WHERE created_at > now() - interval '7 days'
+      GROUP BY tag ORDER BY count DESC LIMIT 8`,
+    prisma.$queryRaw`
+      SELECT book_title AS title, MAX(book_author) AS author, COUNT(*)::int AS count FROM (
+        SELECT book_title, book_author FROM "Topic" WHERE book_title IS NOT NULL AND created_at > now() - interval '30 days'
+        UNION ALL
+        SELECT book_title, book_author FROM "ReadingEntry" WHERE updated_at > now() - interval '30 days'
+      ) b GROUP BY book_title ORDER BY count DESC LIMIT 5`,
+  ]);
+  res.json({ hashtags, books });
+});
+
+// ---- DB admin panel: generic CRUD over every Prisma model, driven by the DMMF ----
+// ponytail: Bytes columns (avatars/covers) are hidden, not editable; add upload fields if needed.
+const { Prisma } = require("@prisma/client");
+const DB_MODELS = Object.fromEntries(Prisma.dmmf.datamodel.models.map((m) => {
+  const fields = m.fields.filter((f) => f.kind !== "object" && f.type !== "Bytes");
+  const key = m.primaryKey?.fields || fields.filter((f) => f.isId).map((f) => f.name);
+  return [m.name, { name: m.name, delegate: m.name[0].toLowerCase() + m.name.slice(1), fields, key }];
+}));
+const DB_ENUMS = Object.fromEntries(Prisma.dmmf.datamodel.enums.map((e) => [e.name, e.values.map((v) => v.name)]));
+const dbAdmin = [authMiddleware, requireRole("admin")];
+
+function dbModel(req, res) {
+  const model = DB_MODELS[req.params.model];
+  if (!model) res.status(404).json({ error: "Unknown model" });
+  return model;
+}
+
+// Only scalar columns pass through; User.password is hashed and left untouched when blank.
+function dbData(model, body = {}) {
+  const data = {};
+  for (const f of model.fields) {
+    if (!(f.name in body)) continue;
+    if (model.name === "User" && f.name === "password") {
+      if (body.password) data.password = hashPassword(body.password);
+    } else {
+      data[f.name] = body[f.name];
+    }
+  }
+  return data;
+}
+
+function dbWhere(model, keyValues = {}) {
+  const pick = Object.fromEntries(model.key.map((k) => [k, keyValues[k]]));
+  return model.key.length === 1 ? pick : { [model.key.join("_")]: pick };
+}
+
+function dbSelect(model) {
+  return Object.fromEntries(model.fields.map((f) => [f.name, !(model.name === "User" && f.name === "password")]));
+}
+
+function dbError(res, err) {
+  res.status(400).json({ error: err.message.split("\n").filter(Boolean).pop() });
+}
+
+app.get("/db/schema", dbAdmin, (req, res) => {
+  res.json({ models: Object.values(DB_MODELS).map(({ delegate, ...m }) => m), enums: DB_ENUMS });
+});
+
+app.get("/db/:model", dbAdmin, async (req, res) => {
+  const model = dbModel(req, res);
+  if (!model) return;
+  const q = (req.query.q || "").trim();
+  const strings = model.fields.filter((f) => f.type === "String" && !f.isList && f.name !== "password");
+  const where = q ? { OR: strings.map((f) => ({ [f.name]: { contains: q, mode: "insensitive" } })) } : {};
+  const skip = Math.max(0, parseInt(req.query.skip, 10) || 0);
+  const take = Math.min(200, parseInt(req.query.take, 10) || 50);
+  try {
+    const delegate = prisma[model.delegate];
+    const [rows, total] = await Promise.all([
+      delegate.findMany({ where, skip, take, select: dbSelect(model), orderBy: model.key.map((k) => ({ [k]: "asc" })) }),
+      delegate.count({ where }),
+    ]);
+    res.json({ rows, total });
+  } catch (err) {
+    dbError(res, err);
+  }
+});
+
+app.post("/db/:model", dbAdmin, async (req, res) => {
+  const model = dbModel(req, res);
+  if (!model) return;
+  try {
+    res.status(201).json(await prisma[model.delegate].create({ data: dbData(model, req.body), select: dbSelect(model) }));
+  } catch (err) {
+    dbError(res, err);
+  }
+});
+
+// Rows are addressed by their primary-key values in the body, since some keys are composite.
+app.put("/db/:model", dbAdmin, async (req, res) => {
+  const model = dbModel(req, res);
+  if (!model) return;
+  try {
+    res.json(await prisma[model.delegate].update({
+      where: dbWhere(model, req.body?.key), data: dbData(model, req.body?.data), select: dbSelect(model),
+    }));
+  } catch (err) {
+    dbError(res, err);
+  }
+});
+
+app.delete("/db/:model", dbAdmin, async (req, res) => {
+  const model = dbModel(req, res);
+  if (!model) return;
+  try {
+    await prisma[model.delegate].delete({ where: dbWhere(model, req.body?.key) });
+    res.status(204).end();
+  } catch (err) {
+    dbError(res, err);
+  }
+});
+
+// Built Solid admin panel (mock-server/admin): `cd admin && npm run build`, then open /panel.
+app.use("/panel", express.static(require("path").join(__dirname, "admin/dist")));
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Mock forum API listening on http://0.0.0.0:${PORT}`);
+});
