@@ -38,6 +38,30 @@ async function resetPostQuotas() {
   }
 }
 
+// Free-plan limits switch (posts per day, communities, topics per community). Premium users never hit them.
+function QuotasToggle() {
+  const [settings, { mutate }] = createResource(() => api("GET", "/admin/settings"));
+  const on = () => (settings.error ? undefined : settings()?.quotas_enabled);
+  async function toggle() {
+    const next = !on();
+    if (!confirm(next
+      ? "Ativar os limites do plano gratuito? Usuários free voltam a ter limite de posts e comunidades."
+      : "Desativar os limites do plano gratuito? Todos os usuários poderão postar e criar comunidades sem limite.")) return;
+    try {
+      mutate(await api("PUT", "/admin/settings", { quotas_enabled: next }));
+    } catch (err) {
+      alert(err.message);
+    }
+  }
+  return (
+    <button class="ghost" disabled={on() === undefined} onClick={toggle} title={settings.error?.message}>
+      {settings.error ? "Limites: indisponível (servidor desatualizado?)"
+        : on() === undefined ? "Limites: …"
+        : on() ? "● Limites de posts: ativos" : "○ Limites de posts: desativados"}
+    </button>
+  );
+}
+
 async function api(method, path, body) {
   const res = await fetch(path, {
     method,
@@ -329,6 +353,7 @@ function Admin() {
           )}
         </For>
         <div class="sidebar-actions">
+          <QuotasToggle />
           <button class="ghost" onClick={resetPostQuotas}>↺ Resetar saldos de posts</button>
           <button class="ghost" onClick={logout}>Sair</button>
         </div>

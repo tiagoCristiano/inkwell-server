@@ -216,3 +216,9 @@ model BookCover {
   content_type String   @default("image/jpeg")
   updated_at   DateTime @updatedAt
 }
+
+// Single row (id 1) of global switches the admin flips from the web panel.
+model AppSettings {
+  id             Int     @id @default(1)
+  quotas_enabled Boolean @default(true) // false = free-plan limits are not enforced for anyone
+}

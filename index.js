@@ -66,7 +66,7 @@ function verifyPassword(password, stored) {
 function issueSession(res, user, status = 200) {
   // ponytail: no expiry so the Kindle stays logged in; add refresh tokens + revocation for the real API.
   const token = jwt.sign({ sub: user.username, role: user.role }, JWT_SECRET);
-  res.status(status).json({ token, username: user.username, role: user.role });
+  res.status(status).json({ token, username: user.username, role: user.role, can_create_moderator: user.role === "admin" });
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -132,7 +132,10 @@ app.post("/admin/users", authMiddleware, requireRole("admin"), async (req, res) 
 
 // avatar_content_type is set together with avatar_data, so it tells us whether there's
 // an avatar without loading the image bytes for every author in a feed page.
-const AUTHOR_SELECT = { username: true, display_name: true, avatar_content_type: true };
+const AUTHOR_SELECT = { username: true, display_name: true, avatar_content_type: true, role: true };
+
+// Role label shown next to the handle; null for plain users. The plugin only prints it.
+const ROLE_BADGE = { admin: "admin", moderator: "moderador" };
 
 function avatarUrl(req, username, hasAvatar) {
   if (!hasAvatar) return null;
@@ -210,11 +213,16 @@ function fullInclude(me) {
   };
 }
 
+// can_delete flags tell the plugin which "Apagar" buttons to draw; the DELETE routes re-check.
 function serializeTopic(req, t) {
+  const { sub, role } = req.user;
+  const isCommunityOwner = t.community?.owner_username === sub;
   return {
     ...topicSummary(req, t),
     selftext: t.selftext,
+    can_delete: isCommunityOwner || canModerate(role, sub, t.author?.role, t.author_username),
     comments: t.comments.map((c) => ({
+      can_delete: canModerate(role, sub, c.author?.role, c.author_username),
       id: c.id,
       parent_id: c.parent_id,
       author: c.author_username,
@@ -458,9 +466,15 @@ function feedPostsUsed(tx, username, user) {
   });
 }
 
+// Admin switch (web panel): when off, nobody hits a free-plan limit. Missing row = on.
+async function quotasEnabled(tx) {
+  const settings = await tx.appSettings.findUnique({ where: { id: 1 } });
+  return settings?.quotas_enabled ?? true;
+}
+
 async function assertCanPost(tx, username, communityId) {
   const user = await planUser(tx, username);
-  if (user.premium) return;
+  if (user.premium || !(await quotasEnabled(tx))) return;
   if (communityId) {
     const count = await tx.topic.count({ where: { author_username: username, community_id: communityId } });
     if (count >= FREE_LIMITS.topicsPerCommunity) {
@@ -476,7 +490,7 @@ async function assertCanPost(tx, username, communityId) {
 }
 
 async function assertCanCreateCommunity(tx, username) {
-  if ((await planUser(tx, username)).premium) return;
+  if ((await planUser(tx, username)).premium || !(await quotasEnabled(tx))) return;
   if ((await tx.community.count({ where: { owner_username: username } })) >= FREE_LIMITS.communities) {
     throw new QuotaError("No plano gratuito você pode criar 1 comunidade. Seja premium para criar sem limites.");
   }
@@ -499,6 +513,19 @@ app.get("/me/plan", authMiddleware, async (req, res) => {
     },
     usage: { feed_posts_today, communities },
   });
+});
+
+app.get("/admin/settings", authMiddleware, requireRole("admin"), async (req, res) => {
+  res.json({ quotas_enabled: await quotasEnabled(prisma) });
+});
+
+app.put("/admin/settings", authMiddleware, requireRole("admin"), async (req, res) => {
+  const quotas_enabled = req.body?.quotas_enabled;
+  if (typeof quotas_enabled !== "boolean") {
+    return res.status(400).json({ error: "quotas_enabled (boolean) is required" });
+  }
+  await prisma.appSettings.upsert({ where: { id: 1 }, create: { quotas_enabled }, update: { quotas_enabled } });
+  res.json({ quotas_enabled });
 });
 
 // Gives every user a fresh daily feed-post balance (posts before now stop counting).
@@ -585,8 +612,16 @@ app.post("/topics", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Resenha precisa de livro, título e texto" });
     }
   }
-  if (community_id != null && !(await prisma.community.findUnique({ where: { id: community_id } }))) {
-    return res.status(400).json({ error: "community_id does not exist" });
+  if (community_id != null) {
+    if (!(await prisma.community.findUnique({ where: { id: community_id } }))) {
+      return res.status(400).json({ error: "community_id does not exist" });
+    }
+    const member = await prisma.communityMember.findUnique({
+      where: { community_id_username: { community_id, username: req.user.sub } },
+    });
+    if (!member) {
+      return res.status(403).json({ error: "Participe da comunidade para postar nela" });
+    }
   }
   const quoted = quoted_id ? await prisma.topic.findUnique({ where: { id: quoted_id } }) : null;
   if (quoted_id && !quoted) {
@@ -673,6 +708,9 @@ function communitySummary(req, c) {
     num_topics: c._count.topics,
     num_members: c._count.members,
     is_member: c.members.length > 0,
+    can_edit_cover: c.owner_username === req.user.sub,
+    can_leave: c.members.length > 0 && c.owner_username !== req.user.sub,
+    can_post: c.members.length > 0,
     created_at: c.created_at.toISOString(),
   };
 }
@@ -798,6 +836,7 @@ function ownProfile(req, user) {
   return {
     username: user.username,
     role: user.role,
+    badge: ROLE_BADGE[user.role] || null,
     display_name: user.display_name,
     bio: user.bio,
     gender: user.gender,
@@ -1071,6 +1110,7 @@ app.get("/users/:username", authMiddleware, async (req, res) => {
       display_name: user.display_name,
       bio: user.bio,
       role: user.role,
+      badge: ROLE_BADGE[user.role] || null,
       avatar_url: avatarUrlFor(req, user),
       is_public: isPublic,
       gender: isPublic ? user.gender : null,
