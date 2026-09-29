@@ -45,8 +45,8 @@ function QuotasToggle() {
   async function toggle() {
     const next = !on();
     if (!confirm(next
-      ? "Ativar os limites do plano gratuito? Usuários free voltam a ter limite de posts e comunidades."
-      : "Desativar os limites do plano gratuito? Todos os usuários poderão postar e criar comunidades sem limite.")) return;
+      ? "Ativar os limites de uso? Usuários que não são apoiadores voltam a ter limite de posts e comunidades."
+      : "Desativar os limites de uso? Todos os usuários poderão postar e criar comunidades sem limite.")) return;
     try {
       mutate(await api("PUT", "/admin/settings", { quotas_enabled: next }));
     } catch (err) {

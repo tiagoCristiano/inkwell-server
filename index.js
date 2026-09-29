@@ -455,8 +455,33 @@ const FREE_LIMITS = {
 };
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+// Usage is free; supporters (a US$1 donation to help keep the server running) get a month
+// without limits. Keyed by the client's Accept-Language (en default, pt_BR).
+const SUPPORT = {
+  en: " Want more? Donate US$1 to help keep the Inkwell server running and become a supporter: no limits for 1 month.",
+  pt_BR: " Quer mais? Doe US$1 para ajudar a manter o servidor do Inkwell e vire apoiador: sem limites por 1 mês.",
+};
+const QUOTA_MESSAGES = {
+  en: {
+    topicsPerCommunity: (n) => `You can create ${n} topic per community.`,
+    feedPostsPerDay: (n) => `You've reached today's limit of ${n} posts.`,
+    communities: (n) => `You can create ${n} community.`,
+  },
+  pt_BR: {
+    topicsPerCommunity: (n) => `Você pode criar ${n} tópico por comunidade.`,
+    feedPostsPerDay: (n) => `Você atingiu o limite de ${n} posts por dia.`,
+    communities: (n) => `Você pode criar ${n} comunidade.`,
+  },
+};
+
 // 402 (not 403) so clients show the message instead of a generic "forbidden".
-class QuotaError extends Error {}
+// Carries only the limit that was hit; the text is built per request language in sendQuotaError.
+class QuotaError extends Error {
+  constructor(limit) {
+    super(limit);
+    this.limit = limit;
+  }
+}
 
 // Runs fn(tx) holding a per-user lock, so concurrent requests can't both pass a quota
 // check before either one's insert lands. The lock is released when the transaction ends.
@@ -493,21 +518,19 @@ async function assertCanPost(tx, username, communityId) {
   if (communityId) {
     const count = await tx.topic.count({ where: { author_username: username, community_id: communityId } });
     if (count >= FREE_LIMITS.topicsPerCommunity) {
-      throw new QuotaError("No plano gratuito você pode criar 1 tópico por comunidade. Seja premium para postar sem limites.");
+      throw new QuotaError("topicsPerCommunity");
     }
     return;
   }
   if ((await feedPostsUsed(tx, username, user)) >= FREE_LIMITS.feedPostsPerDay) {
-    throw new QuotaError(
-      `No plano gratuito você pode publicar ${FREE_LIMITS.feedPostsPerDay} posts por dia. Seja premium para postar sem limites.`,
-    );
+    throw new QuotaError("feedPostsPerDay");
   }
 }
 
 async function assertCanCreateCommunity(tx, username) {
   if ((await planUser(tx, username)).premium || !(await quotasEnabled(tx))) return;
   if ((await tx.community.count({ where: { owner_username: username } })) >= FREE_LIMITS.communities) {
-    throw new QuotaError("No plano gratuito você pode criar 1 comunidade. Seja premium para criar sem limites.");
+    throw new QuotaError("communities");
   }
 }
 
@@ -609,9 +632,11 @@ async function createReadingPost(req, res) {
   res.status(201).json({ topic: await loadFullTopic(req, result.topic.id) });
 }
 
-function sendQuotaError(res, err) {
+function sendQuotaError(req, res, err) {
   if (!(err instanceof QuotaError)) throw err;
-  res.status(402).json({ error: err.message, code: "premium_required" });
+  const lang = req.get("Accept-Language") === "pt_BR" ? "pt_BR" : "en";
+  const error = QUOTA_MESSAGES[lang][err.limit](FREE_LIMITS[err.limit]) + SUPPORT[lang];
+  res.status(402).json({ error, code: "premium_required" });
 }
 
 app.post("/topics", authMiddleware, async (req, res) => {
@@ -662,7 +687,7 @@ app.post("/topics", authMiddleware, async (req, res) => {
       });
     });
   } catch (err) {
-    return sendQuotaError(res, err);
+    return sendQuotaError(req, res, err);
   }
   await saveBookCover(topic.book_title, cover);
   if (quoted) await notify(quoted.author_username, req.user.sub, "quote", topic.id);
@@ -789,7 +814,7 @@ app.post("/communities", authMiddleware, async (req, res) => {
       });
     });
   } catch (err) {
-    return sendQuotaError(res, err);
+    return sendQuotaError(req, res, err);
   }
   res.status(201).json({ community: { ...communitySummary(req, community), topics: [] } });
 });
