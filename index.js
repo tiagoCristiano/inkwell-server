@@ -132,7 +132,7 @@ app.post("/admin/users", authMiddleware, requireRole("admin"), async (req, res) 
 
 // avatar_content_type is set together with avatar_data, so it tells us whether there's
 // an avatar without loading the image bytes for every author in a feed page.
-const AUTHOR_SELECT = { username: true, display_name: true, avatar_content_type: true, role: true };
+const AUTHOR_SELECT = { username: true, display_name: true, avatar_content_type: true, role: true, premium: true };
 
 // Role label shown next to the handle; null for plain users. The plugin only prints it.
 const ROLE_BADGE = { admin: "admin", moderator: "moderador" };
@@ -178,6 +178,7 @@ function topicSummary(req, t) {
     author: t.author_username,
     author_display_name: t.author?.display_name,
     author_avatar_url: avatarUrlFor(req, t.author),
+    author_premium: t.author?.premium === true, // supporters get a crown on their avatar
     book_title: t.book_title,
     book_author: t.book_author,
     hashtags: t.hashtags,

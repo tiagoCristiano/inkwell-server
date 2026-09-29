@@ -5,9 +5,10 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "build": "npm install && npm --prefix admin install && npm run admin:build && npx prisma generate && npx prisma migrate deploy && node prisma/seed.js --if-empty",
+    "build": "npm install && npm --prefix admin install && npm run admin:build && npx prisma generate && npx prisma migrate deploy && node prisma/seed.js --if-empty && node prisma/seed-personas.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "seed": "node prisma/seed.js",
+    "seed:personas": "node prisma/seed-personas.js",
     "admin:dev": "npm --prefix admin run dev",
     "admin:build": "npm --prefix admin run build"
   },
