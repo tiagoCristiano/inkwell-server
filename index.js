@@ -254,9 +254,18 @@ async function loadFullTopic(req, id) {
   return topic && (await attachCovers(req, [serializeTopic(req, topic)]))[0];
 }
 
+// Private authors' posts/reviews are only visible to themselves and their followers.
+// Community posts stay visible to the community.
+async function visiblePosts(me, where) {
+  const allowed = [...(await followedUsernames(me)), me];
+  return {
+    AND: [where, { OR: [{ community_id: { not: null } }, { author: { is_public: true } }, { author_username: { in: allowed } }] }],
+  };
+}
+
 async function listSummaries(req, where, { skip, take } = {}) {
   const topics = await prisma.topic.findMany({
-    where,
+    where: await visiblePosts(req.user.sub, where),
     skip,
     take,
     orderBy: { created_at: "desc" },
@@ -311,7 +320,7 @@ app.get("/topics", authMiddleware, async (req, res) => {
   }
   const [topics, total, unread] = await Promise.all([
     listSummaries(req, where, { skip: offset, take: limit }),
-    prisma.topic.count({ where }),
+    prisma.topic.count({ where: await visiblePosts(req.user.sub, where) }),
     unreadCount(req.user.sub),
   ]);
   res.json({ topics, offset, limit, total, has_more: offset + topics.length < total, unread_notifications: unread });
@@ -338,7 +347,8 @@ app.get("/topics/search", authMiddleware, async (req, res) => {
 });
 
 app.get("/topics/:id", authMiddleware, async (req, res) => {
-  const topic = await loadFullTopic(req, req.params.id);
+  const visible = await prisma.topic.count({ where: await visiblePosts(req.user.sub, { id: req.params.id }) });
+  const topic = visible && (await loadFullTopic(req, req.params.id));
   if (!topic) {
     return res.status(404).json({ error: "Topic not found" });
   }
@@ -969,7 +979,7 @@ app.get("/me/suggestions", authMiddleware, async (req, res) => {
   const picked = new Map(); // username -> reason
   if (myBooks.length > 0) {
     const sameBook = await prisma.readingEntry.findMany({
-      where: { book_title: { in: myBooks }, username: { notIn: [...exclude] } },
+      where: { book_title: { in: myBooks }, username: { notIn: [...exclude] }, user: { is_public: true } },
       orderBy: { updated_at: "desc" },
       take: 20,
     });
@@ -977,7 +987,7 @@ app.get("/me/suggestions", authMiddleware, async (req, res) => {
   }
   const popular = await prisma.following.groupBy({
     by: ["followed_username"],
-    where: { followed_username: { notIn: [...exclude] } },
+    where: { followed_username: { notIn: [...exclude] }, followed: { is_public: true } },
     _count: { follower_username: true },
     orderBy: { _count: { follower_username: "desc" } },
     take: 10,
@@ -985,7 +995,7 @@ app.get("/me/suggestions", authMiddleware, async (req, res) => {
   for (const p of popular) if (!picked.has(p.followed_username)) picked.set(p.followed_username, "Popular no Inkwell");
   if (picked.size < 10) {
     const recent = await prisma.topic.findMany({
-      where: { author_username: { notIn: [...exclude, ...picked.keys()] } },
+      where: { author_username: { notIn: [...exclude, ...picked.keys()] }, author: { is_public: true } },
       orderBy: { created_at: "desc" },
       distinct: ["author_username"],
       select: { author_username: true },
@@ -1137,7 +1147,10 @@ app.get("/books", authMiddleware, async (req, res) => {
   if (!title) return res.status(400).json({ error: "title is required" });
   const [entries, topics] = await Promise.all([
     prisma.readingEntry.findMany({
-      where: { book_title: title },
+      where: {
+        book_title: title,
+        OR: [{ user: { is_public: true } }, { username: { in: [...(await followedUsernames(req.user.sub)), req.user.sub] } }],
+      },
       orderBy: { updated_at: "desc" },
       include: { user: { select: AUTHOR_SELECT } },
       take: 50,

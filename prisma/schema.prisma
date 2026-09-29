@@ -31,7 +31,7 @@ model User {
   bio             String    @default("")
   gender          Gender?
   age             Int?
-  is_public       Boolean   @default(true)
+  is_public       Boolean   @default(false)
   // Premium lifts the free-plan quotas enforced by the API (see FREE_LIMITS in index.js).
   premium         Boolean   @default(false)
   // Set by the admin "reset post balances" action: feed posts before it don't count toward the daily quota.
