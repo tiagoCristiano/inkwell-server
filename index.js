@@ -255,11 +255,16 @@ async function loadFullTopic(req, id) {
 }
 
 // Private authors' posts/reviews are only visible to themselves and their followers.
-// Community posts stay visible to the community.
+// Community posts follow the community instead: everyone for public ones, members for private ones.
 async function visiblePosts(me, where) {
   const allowed = [...(await followedUsernames(me)), me];
   return {
-    AND: [where, { OR: [{ community_id: { not: null } }, { author: { is_public: true } }, { author_username: { in: allowed } }] }],
+    AND: [where, {
+      OR: [
+        { community: { OR: [{ is_private: false }, { members: { some: { username: me, status: "member" } } }] } },
+        { community_id: null, OR: [{ author: { is_public: true } }, { author_username: { in: allowed } }] },
+      ],
+    }],
   };
 }
 
@@ -278,10 +283,10 @@ async function listSummaries(req, where, { skip, take } = {}) {
 // Notifications
 // ---------------------------------------------------------------------------
 
-async function notify(recipient, actor, type, topicId = null) {
+async function notify(recipient, actor, type, topicId = null, communityId = null) {
   if (!recipient || recipient === actor) return;
   await prisma.notification.create({
-    data: { recipient_username: recipient, actor_username: actor, type, topic_id: topicId },
+    data: { recipient_username: recipient, actor_username: actor, type, topic_id: topicId, community_id: communityId },
   });
 }
 
@@ -553,14 +558,15 @@ const READING_POSTS = {
 
 // Validates a reading post against the user's shelf and returns { fields } or { error }.
 // Allowed once per book and event: "started" needs the book on the shelf, "finished" needs it finished.
-async function readingPost(tx, username, book_title, event, lang) {
+async function readingPost(tx, username, book_title, book_author, event, lang) {
   const texts = READING_POSTS[lang] || READING_POSTS.en;
   if (!texts[event]) return { error: "reading_event must be started or finished" };
-  const entry = await tx.readingEntry.findUnique({ where: { username_book_title: { username, book_title } } });
-  if (!entry || (event === "finished" && entry.status !== "finished")) {
+  const entry = await findShelfEntry(tx, username, book_title, book_author);
+  if (!entry || entry.status === "want" || (event === "finished" && entry.status !== "finished")) {
     return { error: "Livro não está na sua estante com esse status" };
   }
-  if (await tx.topic.count({ where: { author_username: username, book_title, reading_event: event } })) {
+  book_title = entry.book_title;
+  if (await tx.topic.count({ where: { author_username: username, book_title: { equals: book_title, mode: "insensitive" }, reading_event: event } })) {
     return { error: "Essa leitura já foi compartilhada" };
   }
   const book = entry.book_author ? texts.by.replace("%s", book_title).replace("%s", entry.book_author) : book_title;
@@ -588,18 +594,18 @@ async function saveBookCover(book_title, cover) {
   });
 }
 
-// Body: { reading_event, book_title, lang, cover }. Anything else the client sends is ignored.
+// Body: { reading_event, book_title, book_author, lang, cover }. Anything else the client sends is ignored.
 async function createReadingPost(req, res) {
-  const book_title = (req.body.book_title || "").trim();
+  const book_title = normBook(req.body.book_title);
   if (!book_title) return res.status(400).json({ error: "book_title is required" });
   // Same per-user lock as the quotas: two racing requests can't both share one event.
   const result = await withUserLock(req.user.sub, async (tx) => {
-    const built = await readingPost(tx, req.user.sub, book_title, req.body.reading_event, req.body.lang);
+    const built = await readingPost(tx, req.user.sub, book_title, req.body.book_author, req.body.reading_event, req.body.lang);
     if (built.error) return built;
     return { topic: await tx.topic.create({ data: { ...built.fields, author_username: req.user.sub } }) };
   });
   if (result.error) return res.status(400).json({ error: result.error });
-  await saveBookCover(book_title, req.body.cover);
+  await saveBookCover(result.topic.book_title, req.body.cover);
   res.status(201).json({ topic: await loadFullTopic(req, result.topic.id) });
 }
 
@@ -629,7 +635,7 @@ app.post("/topics", authMiddleware, async (req, res) => {
     const member = await prisma.communityMember.findUnique({
       where: { community_id_username: { community_id, username: req.user.sub } },
     });
-    if (!member) {
+    if (member?.status !== "member") {
       return res.status(403).json({ error: "Participe da comunidade para postar nela" });
     }
   }
@@ -707,6 +713,9 @@ for (const method of ["post", "delete"]) {
 
 // Expects c loaded with communityInclude(username).
 function communitySummary(req, c) {
+  const status = c.members[0]?.status; // the caller's: member | pending | undefined
+  const isMember = status === "member";
+  const isOwner = c.owner_username === req.user.sub;
   return {
     id: c.id,
     cover_url: c.cover_updated_at
@@ -717,20 +726,37 @@ function communitySummary(req, c) {
     owner: c.owner_username,
     num_topics: c._count.topics,
     num_members: c._count.members,
-    is_member: c.members.length > 0,
-    can_edit_cover: c.owner_username === req.user.sub,
-    can_leave: c.members.length > 0 && c.owner_username !== req.user.sub,
-    can_post: c.members.length > 0,
+    is_private: c.is_private,
+    is_member: isMember,
+    is_pending: status === "pending",
+    can_see_posts: !c.is_private || isMember,
+    can_manage: isOwner, // cover, privacy, join requests
+    can_edit_cover: isOwner,
+    can_leave: isMember && !isOwner,
+    can_post: isMember,
     created_at: c.created_at.toISOString(),
   };
 }
 
-// Counts, plus the caller's own membership row (if any) for is_member.
+// Counts, plus the caller's own membership row (if any) for is_member / is_pending.
 function communityInclude(username) {
   return {
-    _count: { select: { topics: true, members: true } },
-    members: { where: { username }, select: { username: true } },
+    _count: { select: { topics: true, members: { where: { status: "member" } } } },
+    members: { where: { username }, select: { status: true } },
   };
+}
+
+// Loads a community for an owner-only action; sends the error and returns null otherwise.
+async function ownedCommunity(req, res) {
+  const community = await prisma.community.findUnique({ where: { id: req.params.id } });
+  if (!community) {
+    res.status(404).json({ error: "Comunidade não encontrada" });
+  } else if (community.owner_username !== req.user.sub) {
+    res.status(403).json({ error: "Só o dono da comunidade pode fazer isso" });
+  } else {
+    return community;
+  }
+  return null;
 }
 
 // ponytail: no pagination, add offset/limit like /topics once there are many communities.
@@ -776,8 +802,70 @@ app.get("/communities/:id", authMiddleware, async (req, res) => {
   if (!community) {
     return res.status(404).json({ error: "Comunidade não encontrada" });
   }
-  const topics = await listSummaries(req, { community_id: community.id });
-  res.json({ community: { ...communitySummary(req, community), topics } });
+  const summary = communitySummary(req, community);
+  const [topics, requests] = await Promise.all([
+    summary.can_see_posts ? listSummaries(req, { community_id: community.id }) : [],
+    summary.can_manage
+      ? prisma.communityMember.findMany({
+          where: { community_id: community.id, status: "pending" },
+          orderBy: { joined_at: "asc" },
+          include: { user: { select: AUTHOR_SELECT } },
+        })
+      : [],
+  ]);
+  res.json({
+    community: {
+      ...summary,
+      topics,
+      // Owner only: people waiting for approval.
+      requests: requests.map((r) => ({
+        username: r.username,
+        display_name: r.user.display_name,
+        avatar_url: avatarUrlFor(req, r.user),
+        requested_at: r.joined_at.toISOString(),
+      })),
+    },
+  });
+});
+
+// Owner-only. Body: { is_private }. Turning a community public lets everyone waiting in.
+app.put("/communities/:id/privacy", authMiddleware, async (req, res) => {
+  const community = await ownedCommunity(req, res);
+  if (!community) return;
+  if (typeof req.body?.is_private !== "boolean") {
+    return res.status(400).json({ error: "is_private (boolean) is required" });
+  }
+  const [updated] = await prisma.$transaction([
+    prisma.community.update({ where: { id: community.id }, data: { is_private: req.body.is_private } }),
+    ...(req.body.is_private
+      ? []
+      : [prisma.communityMember.updateMany({ where: { community_id: community.id, status: "pending" }, data: { status: "member" } })]),
+  ]);
+  const full = await prisma.community.findUnique({ where: { id: updated.id }, include: communityInclude(req.user.sub) });
+  res.json({ community: communitySummary(req, full) });
+});
+
+// Owner-only: approve (POST) or refuse (DELETE) a pending join request.
+app.post("/communities/:id/requests/:username", authMiddleware, async (req, res) => {
+  const community = await ownedCommunity(req, res);
+  if (!community) return;
+  const { count } = await prisma.communityMember.updateMany({
+    where: { community_id: community.id, username: req.params.username, status: "pending" },
+    data: { status: "member", joined_at: new Date() },
+  });
+  if (!count) return res.status(404).json({ error: "Pedido não encontrado" });
+  await notify(req.params.username, req.user.sub, "community_approved", null, community.id);
+  res.status(204).end();
+});
+
+app.delete("/communities/:id/requests/:username", authMiddleware, async (req, res) => {
+  const community = await ownedCommunity(req, res);
+  if (!community) return;
+  const { count } = await prisma.communityMember.deleteMany({
+    where: { community_id: community.id, username: req.params.username, status: "pending" },
+  });
+  if (!count) return res.status(404).json({ error: "Pedido não encontrado" });
+  res.status(204).end();
 });
 
 // Owner-only. Body: { data: "<base64>", content_type }. Replaces any existing cover.
@@ -812,16 +900,25 @@ app.get("/communities/:id/cover", async (req, res) => {
   res.send(community.cover_data);
 });
 
+// Join. Public communities let you straight in; private ones record a request (status
+// "pending") and notify the owner. Returns { status: "member" | "pending" }.
 app.post("/communities/:id/members", authMiddleware, async (req, res) => {
   const where = { community_id_username: { community_id: req.params.id, username: req.user.sub } };
-  if (!(await prisma.community.findUnique({ where: { id: req.params.id } }))) {
+  const community = await prisma.community.findUnique({ where: { id: req.params.id } });
+  if (!community) {
     return res.status(404).json({ error: "Comunidade não encontrada" });
   }
-  await prisma.communityMember.upsert({ where, create: where.community_id_username, update: {} });
-  res.status(204).end();
+  const existing = await prisma.communityMember.findUnique({ where });
+  if (existing) return res.json({ status: existing.status });
+  const status = community.is_private ? "pending" : "member";
+  await prisma.communityMember.create({ data: { ...where.community_id_username, status } });
+  if (status === "pending") {
+    await notify(community.owner_username, req.user.sub, "community_request", null, community.id);
+  }
+  res.json({ status });
 });
 
-// Leave. The owner can't leave their own community (it would be left without an owner member).
+// Leave, or cancel a pending request. The owner can't leave their own community (it would be left without an owner member).
 app.delete("/communities/:id/members", authMiddleware, async (req, res) => {
   const community = await prisma.community.findUnique({ where: { id: req.params.id } });
   if (!community) {
@@ -909,6 +1006,7 @@ app.get("/me/notifications", authMiddleware, async (req, res) => {
     include: {
       actor: { select: AUTHOR_SELECT },
       topic: { select: { title: true, selftext: true } },
+      community: { select: { title: true } },
     },
   });
   res.json({
@@ -922,6 +1020,8 @@ app.get("/me/notifications", authMiddleware, async (req, res) => {
       actor_avatar_url: avatarUrlFor(req, n.actor),
       topic_id: n.topic_id,
       topic_excerpt: n.topic ? (n.topic.title || n.topic.selftext).slice(0, 80) : null,
+      community_id: n.community_id,
+      community_title: n.community?.title || null,
       created_at: n.created_at.toISOString(),
     })),
   });
@@ -932,31 +1032,80 @@ app.post("/me/notifications/read", authMiddleware, async (req, res) => {
   res.status(204).end();
 });
 
-// The plugin pushes the book being read. Body: { book_title, book_author, progress (0-100), status? }.
-// Reaching 100% (or status "finished") marks it finished. Returns the entry plus what changed,
-// so the plugin can auto-post "começou"/"terminou" exactly once.
-app.put("/me/reading", authMiddleware, async (req, res) => {
-  const book_title = (req.body?.book_title || "").trim();
-  if (!book_title) return res.status(400).json({ error: "book_title is required" });
-  const progress = Math.min(Math.max(parseInt(req.body?.progress, 10) || 0, 0), 100);
-  const where = { username_book_title: { username: req.user.sub, book_title } };
-  const previous = await prisma.readingEntry.findUnique({ where });
-  const finished = req.body?.status === "finished" || progress >= 100 || previous?.status === "finished";
-  const data = {
-    book_author: (req.body?.book_author || previous?.book_author || "").trim(),
-    progress: finished ? 100 : progress,
-    status: finished ? "finished" : "reading",
-  };
-  const entry = await prisma.readingEntry.upsert({
-    where,
-    create: { username: req.user.sub, book_title, ...data },
-    update: data,
+// Book titles/authors are compared ignoring case and extra spaces, so "Dom  casmurro" and
+// "Dom Casmurro" are one book. ponytail: no edition matching (subtitles, translations); needs a catalog/ISBN.
+const normBook = (s) => (typeof s === "string" ? s : "").trim().replace(/\s+/g, " ");
+
+// The user's shelf entry for a book: same title, and same author unless either side is blank.
+async function findShelfEntry(db, username, book_title, book_author) {
+  const author = normBook(book_author).toLowerCase();
+  const entries = await db.readingEntry.findMany({
+    where: { username, book_title: { equals: normBook(book_title), mode: "insensitive" } },
   });
+  return entries.find((e) => e.book_author.toLowerCase() === author)
+    || entries.find((e) => !author || !e.book_author)
+    || null;
+}
+
+const SHELF_STATUSES = ["want", "reading", "finished"];
+
+// Body: { book_title, book_author, progress (0-100), status?, background? }. Without status
+// (the plugin's automatic sync) the book is "reading" until 100%, and a finished book stays
+// finished. background (sync on closing the book, no share prompt possible) only updates
+// progress of books already on the shelf and never finishes one, so it can't use up the
+// one-time started/finished events.
+// An explicit status is the user's choice and wins: "want" (quero ler), "reading" (re-read
+// from progress), "finished". Returns the entry plus what changed, so the plugin can offer
+// the "começou"/"terminou" post exactly once.
+app.put("/me/reading", authMiddleware, async (req, res) => {
+  const book_title = normBook(req.body?.book_title);
+  if (!book_title) return res.status(400).json({ error: "book_title is required" });
+  const status = req.body?.status;
+  if (status != null && !SHELF_STATUSES.includes(status)) {
+    return res.status(400).json({ error: "status must be want, reading or finished" });
+  }
+  const background = req.body?.background === true;
+  const progress = Math.min(Math.max(parseInt(req.body?.progress, 10) || 0, 0), background ? 99 : 100);
+  const username = req.user.sub;
+  const previous = await findShelfEntry(prisma, username, book_title, req.body?.book_author);
+  if (background && (!previous || previous.status === "want" || status != null)) {
+    return res.json({ entry: previous && serializeReading(previous), started: false, finished_now: false });
+  }
+  const next = status === "want" ? "want"
+    : status === "finished" || progress >= 100 || (!status && previous?.status === "finished") ? "finished"
+    : "reading";
+  const data = {
+    book_author: previous?.book_author || normBook(req.body?.book_author),
+    progress: next === "finished" ? 100 : next === "want" ? 0 : progress,
+    status: next,
+  };
+  let entry;
+  if (previous) {
+    const key = { username, book_title: previous.book_title, book_author: previous.book_author };
+    entry = await prisma.readingEntry.update({ where: { username_book_title_book_author: key }, data });
+  } else {
+    // Reuse the spelling other readers already have, so everyone lands on the same book page.
+    const known = await prisma.readingEntry.findFirst({
+      where: { book_title: { equals: book_title, mode: "insensitive" } },
+      select: { book_title: true },
+    });
+    entry = await prisma.readingEntry.create({ data: { username, book_title: known?.book_title || book_title, ...data } });
+  }
   res.json({
     entry: serializeReading(entry),
-    started: !previous,
-    finished_now: finished && previous?.status !== "finished",
+    started: next !== "want" && (!previous || previous.status === "want"),
+    finished_now: next === "finished" && previous?.status !== "finished",
   });
+});
+
+// Query: title, author. Removes the book from the user's shelf (their posts stay).
+app.delete("/me/reading", authMiddleware, async (req, res) => {
+  const entry = await findShelfEntry(prisma, req.user.sub, req.query.title, req.query.author);
+  if (!entry) return res.status(404).json({ error: "Livro não está na sua estante" });
+  await prisma.readingEntry.delete({
+    where: { username_book_title_book_author: { username: entry.username, book_title: entry.book_title, book_author: entry.book_author } },
+  });
+  res.status(204).end();
 });
 
 function serializeReading(e) {
@@ -1107,7 +1256,8 @@ app.get("/users/:username", authMiddleware, async (req, res) => {
     prisma.following.findUnique({ where: { follower_username_followed_username: { follower_username: me, followed_username: username } } }),
     prisma.following.findUnique({ where: { follower_username_followed_username: { follower_username: username, followed_username: me } } }),
     listSummaries(req, { author_username: username }, { take: 20 }),
-    prisma.readingEntry.findMany({ where: { username }, orderBy: { updated_at: "desc" }, take: 30 }),
+    // ponytail: whole shelf in the profile payload; paginate if shelves reach thousands of books.
+    prisma.readingEntry.findMany({ where: { username }, orderBy: { updated_at: "desc" } }),
   ]);
 
   const isPublic = user.is_public !== false;
@@ -1141,29 +1291,38 @@ app.get("/users/:username", authMiddleware, async (req, res) => {
 // Books / trending
 // ---------------------------------------------------------------------------
 
-// Book page: everyone who has it on their shelf, plus every post about it.
+// Book page: everyone who has it on their shelf, plus every post about it, plus the
+// viewer's own shelf entry (my_entry). Query: title, author (optional; tells apart
+// different books with the same title — blank authors match any).
 app.get("/books", authMiddleware, async (req, res) => {
-  const title = (req.query.title || "").trim();
+  const title = normBook(req.query.title);
   if (!title) return res.status(400).json({ error: "title is required" });
-  const [entries, topics] = await Promise.all([
+  const me = req.user.sub;
+  const author = normBook(req.query.author);
+  const byAuthor = (blank) => (author ? { OR: [{ book_author: { equals: author, mode: "insensitive" } }, ...blank] } : {});
+  const [entries, topics, mine] = await Promise.all([
     prisma.readingEntry.findMany({
       where: {
-        book_title: title,
-        OR: [{ user: { is_public: true } }, { username: { in: [...(await followedUsernames(req.user.sub)), req.user.sub] } }],
+        book_title: { equals: title, mode: "insensitive" },
+        ...byAuthor([{ book_author: "" }]),
+        AND: { OR: [{ user: { is_public: true } }, { username: { in: [...(await followedUsernames(me)), me] } }] },
       },
       orderBy: { updated_at: "desc" },
       include: { user: { select: AUTHOR_SELECT } },
       take: 50,
     }),
-    listSummaries(req, { book_title: title }, { take: 50 }),
+    listSummaries(req, { book_title: { equals: title, mode: "insensitive" }, ...byAuthor([{ book_author: null }, { book_author: "" }]) }, { take: 50 }),
+    findShelfEntry(prisma, me, title, author),
   ]);
-  const author = entries.find((e) => e.book_author)?.book_author || topics.find((t) => t.book_author)?.book_author || "";
-  const cover = await prisma.bookCover.findUnique({ where: { book_title: title }, select: { book_title: true } });
+  const bookAuthor = author || entries.find((e) => e.book_author)?.book_author || topics.find((t) => t.book_author)?.book_author || "";
+  const bookTitle = entries[0]?.book_title || topics[0]?.book_title || title;
+  const cover = await prisma.bookCover.findUnique({ where: { book_title: bookTitle }, select: { book_title: true } });
   res.json({
     book: {
-      title,
-      author,
-      cover_url: cover ? coverUrl(req, title) : null,
+      title: bookTitle,
+      author: bookAuthor,
+      cover_url: cover ? coverUrl(req, bookTitle) : null,
+      my_entry: mine ? serializeReading(mine) : null,
       readers: entries.map((e) => ({
         username: e.username,
         display_name: e.user.display_name,
