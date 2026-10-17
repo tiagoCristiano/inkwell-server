@@ -2,6 +2,7 @@
 // discussion) on top of whatever is already in the database. Never deletes anything: rows use
 // stable ids / natural keys, so running it again only updates the seeded content in place.
 // Run with `npm run seed:personas`. Data lives in prisma/personas/<username>.js.
+// `--en` (npm run seed:personas:en) seeds the English set in prisma/personas-en/ instead.
 require("dotenv/config");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -9,7 +10,10 @@ const path = require("path");
 const { PrismaClient } = require("@prisma/client");
 
 const prisma = new PrismaClient();
-const PASSWORD = "inkwell123"; // log in as <username>@inkwell.dev
+// log in as <username>@inkwell.dev. Deploy passes --random-passwords: the fixed one is public in this repo.
+const PASSWORD = process.argv.includes("--random-passwords")
+  ? crypto.randomBytes(12).toString("base64url")
+  : "inkwell123";
 const HOUR = 3600 * 1000;
 
 // Same "salt:hash" format as hashPassword in index.js.
@@ -18,7 +22,7 @@ function hashPassword(password) {
   return `${salt}:${crypto.scryptSync(password, salt, 64).toString("hex")}`;
 }
 
-const dir = path.join(__dirname, "personas");
+const dir = path.join(__dirname, process.argv.includes("--en") ? "personas-en" : "personas");
 const PERSONAS = fs
   .readdirSync(dir)
   .filter((f) => f.endsWith(".js"))
@@ -120,7 +124,7 @@ async function main() {
     await prisma.$transaction((tx) => seedPersona(tx, p, i), { timeout: 60_000 });
     console.log(`  ${p.user.username}: ${p.posts.length} posts, ${p.reviews.length} reviews, community "${p.community.title}"`);
   }
-  console.log(`Done. Password for every persona: ${PASSWORD}`);
+  console.log(PASSWORD === "inkwell123" ? `Done. Password for every persona: ${PASSWORD}` : "Done.");
 }
 
 main()

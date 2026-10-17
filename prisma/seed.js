@@ -13,12 +13,8 @@ function hashPassword(password) {
   return `${salt}:${crypto.scryptSync(password, salt, 64).toString("hex")}`;
 }
 
-// Log in as <username>@inkwell.dev (the plugin's quick-login buttons use these).
-const USERS = [
-  { username: "admin", password: "admin123", role: "admin", display_name: "Admin", bio: "Mantenedor do Inkwell. Leio ficção científica no ônibus e clássicos no fim de semana.", gender: "masc", age: 34, is_public: true },
-  { username: "moderador", password: "mod123", role: "moderator", display_name: "Moderador", bio: "Ajuda a manter a ordem por aqui. Fã de poesia e de edições comentadas.", gender: "masc", age: 29, is_public: true },
-  { username: "usuario", password: "user123", role: "user", display_name: "Usuário", bio: "Só um leitor comum, tentando vencer a pilha de livros na mesa de cabeceira.", gender: "feminino", age: 22, is_public: false },
-];
+// Log in as usuario@inkwell.dev (the plugin's quick-login buttons use these).
+const USERS = [];
 
 const P = {
   a: "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Integer posuere erat a ante venenatis dapibus posuere velit aliquet. Cras mattis consectetur purus sit amet fermentum. Donec ullamcorper nulla non metus auctor fringilla, vestibulum id ligula porta felis euismod semper.",
@@ -31,7 +27,8 @@ const P = {
 const POSTS = [
   {
     author: "admin",
-    title: "Relendo Dom Casmurro depois de quinze anos: o que muda quando a gente amadurece junto com o livro",
+    title:
+      "Relendo Dom Casmurro depois de quinze anos: o que muda quando a gente amadurece junto com o livro",
     book_title: "Dom Casmurro",
     book_author: "Machado de Assis",
     hashtags: ["classicos", "releitura", "machado"],
@@ -39,13 +36,15 @@ const POSTS = [
   },
   {
     author: "admin",
-    title: "Guia completo: configurando o KOReader no Kindle para leitura noturna sem cansar a vista",
+    title:
+      "Guia completo: configurando o KOReader no Kindle para leitura noturna sem cansar a vista",
     hashtags: ["koreader", "kindle", "dica"],
     selftext: `${P.b}\n\n${P.c} A documentação oficial explica cada opção de refresh: https://koreader.rocks/user_guide/\n\n${P.a}\n\n${P.d} Os plugins que uso estão listados em https://github.com/koreader/koreader/wiki`,
   },
   {
     author: "moderador",
-    title: "Drummond, Cecília e Pessoa: por que a poesia rende tanto em tela de tinta eletrônica",
+    title:
+      "Drummond, Cecília e Pessoa: por que a poesia rende tanto em tela de tinta eletrônica",
     book_title: "Mensagem",
     book_author: "Fernando Pessoa",
     hashtags: ["poesia", "leitura"],
@@ -54,13 +53,15 @@ const POSTS = [
   },
   {
     author: "moderador",
-    title: "Regras da casa, moderação e como manter as discussões sobre livros civilizadas e sem spoilers",
+    title:
+      "Regras da casa, moderação e como manter as discussões sobre livros civilizadas e sem spoilers",
     hashtags: ["comunidade", "regras"],
     selftext: `${P.d}\n\n${P.b}\n\n${P.a} Em caso de dúvida, marque o spoiler e deixe um aviso no início do post.\n\n${P.c}`,
   },
   {
     author: "usuario",
-    title: "Terminei Duna e preciso falar sobre o final: a ecologia de Arrakis como personagem principal",
+    title:
+      "Terminei Duna e preciso falar sobre o final: a ecologia de Arrakis como personagem principal",
     book_title: "Duna",
     book_author: "Frank Herbert",
     hashtags: ["ficcaocientifica", "resenha"],
@@ -68,7 +69,8 @@ const POSTS = [
   },
   {
     author: "usuario",
-    title: "Minha pilha de leitura para o próximo semestre e um pedido de recomendações de vocês",
+    title:
+      "Minha pilha de leitura para o próximo semestre e um pedido de recomendações de vocês",
     hashtags: ["tbr", "livros"],
     selftext: `${P.b}\n\n${P.a}\n\n${P.d}\n\n${P.c}`,
   },
@@ -93,8 +95,24 @@ async function main() {
   );
 
   console.log(`Seeding ${USERS.length} users...`);
+  // Deploy (--if-empty) gets random passwords, printed once here: the fixed ones are public
+  // in this repo and only meant for local test logins.
+  const deploy = process.argv.includes("--if-empty");
+  const users = USERS.map((u) => ({
+    ...u,
+    password: deploy
+      ? crypto.randomBytes(12).toString("base64url")
+      : u.password,
+  }));
+  if (deploy)
+    for (const u of users)
+      console.log(`  ${u.username}@inkwell.dev: ${u.password}`);
   await prisma.user.createMany({
-    data: USERS.map((u) => ({ ...u, email: `${u.username}@inkwell.dev`, password: hashPassword(u.password) })),
+    data: users.map((u) => ({
+      ...u,
+      email: `${u.username}@inkwell.dev`,
+      password: hashPassword(u.password),
+    })),
   });
 
   await prisma.following.createMany({
@@ -109,7 +127,8 @@ async function main() {
     data: {
       id: "seed-community-poesia",
       title: "Poesia",
-      description: "Drummond, Cecília, Pessoa. Poste o verso que te pegou hoje.",
+      description:
+        "Drummond, Cecília, Pessoa. Poste o verso que te pegou hoje.",
       owner_username: "moderador",
       members: { create: USERS.map((u) => ({ username: u.username })) },
     },
@@ -120,9 +139,16 @@ async function main() {
     const { community: slug, author, ...data } = post;
     const created_at = new Date(Date.now() - (i + 1) * 5 * 3600 * 1000);
     const topic = await prisma.topic.create({
-      data: { ...data, community_id: slug ? community.id : null, author_username: author, created_at },
+      data: {
+        ...data,
+        community_id: slug ? community.id : null,
+        author_username: author,
+        created_at,
+      },
     });
-    const others = USERS.map((u) => u.username).filter((u) => u !== post.author);
+    const others = USERS.map((u) => u.username).filter(
+      (u) => u !== post.author,
+    );
     const comments = await prisma.comment.createManyAndReturn({
       data: COMMENTS.map((body, k) => ({
         body,
