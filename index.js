@@ -4,7 +4,6 @@ const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 const { PrismaClient } = require("@prisma/client");
 
-// No fallback: a known default secret lets anyone forge admin tokens.
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error("JWT_SECRET is not set");
 const PORT = process.env.PORT || 3001;
@@ -16,14 +15,19 @@ app.disable("x-powered-by");
 // Reverse-proxy hops in front of the app, for req.ip (login rate limit) and req.protocol
 // (https image URLs). Render: 3 per its community forum (verify); too high lets clients
 // spoof their IP through X-Forwarded-For. Override with TRUST_PROXY_HOPS.
-app.set("trust proxy", Number(process.env.TRUST_PROXY_HOPS ?? (process.env.RENDER ? 3 : 0)));
+app.set(
+  "trust proxy",
+  Number(process.env.TRUST_PROXY_HOPS ?? (process.env.RENDER ? 3 : 0)),
+);
 
 // Only routes that carry a base64 image (avatar, community cover, book cover on POST /topics)
 // get a large body; the body limit is the image limit (~2 MB decoded).
 const IMAGE_BODY_ROUTES = /^\/(me\/avatar|communities\/[^/]+\/cover|topics)$/;
 const jsonImage = express.json({ limit: "3mb" });
 const jsonSmall = express.json({ limit: "200kb" });
-app.use((req, res, next) => (IMAGE_BODY_ROUTES.test(req.path) ? jsonImage : jsonSmall)(req, res, next));
+app.use((req, res, next) =>
+  (IMAGE_BODY_ROUTES.test(req.path) ? jsonImage : jsonSmall)(req, res, next),
+);
 
 // Max length of string fields in any JSON body, so posts, bios and shelf titles can't be
 // used to fill the database.
@@ -46,11 +50,19 @@ app.use((req, res, next) => {
   const b = req.body;
   for (const [field, max] of Object.entries(MAX_LEN)) {
     if (typeof b?.[field] === "string" && b[field].length > max) {
-      return res.status(400).json({ error: `Texto muito longo: ${field} aceita até ${max} caracteres` });
+      return res.status(400).json({
+        error: `Texto muito longo: ${field} aceita até ${max} caracteres`,
+      });
     }
   }
-  if (Array.isArray(b?.hashtags) && (b.hashtags.length > MAX_HASHTAGS || b.hashtags.some((h) => String(h).length > MAX_HASHTAG_LEN))) {
-    return res.status(400).json({ error: `Use até ${MAX_HASHTAGS} hashtags de até ${MAX_HASHTAG_LEN} caracteres` });
+  if (
+    Array.isArray(b?.hashtags) &&
+    (b.hashtags.length > MAX_HASHTAGS ||
+      b.hashtags.some((h) => String(h).length > MAX_HASHTAG_LEN))
+  ) {
+    return res.status(400).json({
+      error: `Use até ${MAX_HASHTAGS} hashtags de até ${MAX_HASHTAG_LEN} caracteres`,
+    });
   }
   next();
 });
@@ -71,7 +83,10 @@ async function authMiddleware(req, res, next) {
   }
   // Role comes from the DB, not the token: tokens don't expire, so a demoted or deleted
   // user must lose access right away.
-  const user = await prisma.user.findUnique({ where: { username: payload.sub }, select: { role: true } });
+  const user = await prisma.user.findUnique({
+    where: { username: payload.sub },
+    select: { role: true },
+  });
   if (!user) {
     return res.status(401).json({ error: "Invalid or expired token" });
   }
@@ -96,7 +111,9 @@ function rateLimit(max, windowMs) {
     }
     if (++a.count > max) {
       res.set("Retry-After", String(Math.ceil((a.resetAt - now) / 1000)));
-      return res.status(429).json({ error: "Muitas tentativas. Tente de novo em alguns minutos." });
+      return res
+        .status(429)
+        .json({ error: "Muitas tentativas. Tente de novo em alguns minutos." });
     }
     next();
   };
@@ -152,14 +169,12 @@ function issueSession(res, user, status = 200) {
   // ponytail: no expiry so the Kindle stays logged in (role is re-read from the DB on every request);
   // a leaked token stays valid until JWT_SECRET changes. Add refresh tokens + revocation for the real API.
   const token = jwt.sign({ sub: user.username, role: user.role }, JWT_SECRET);
-  res
-    .status(status)
-    .json({
-      token,
-      username: user.username,
-      role: user.role,
-      can_create_moderator: user.role === "admin",
-    });
+  res.status(status).json({
+    token,
+    username: user.username,
+    role: user.role,
+    can_create_moderator: user.role === "admin",
+  });
 }
 
 const DUMMY_HASH = `${"0".repeat(32)}:${"0".repeat(128)}`;
@@ -443,7 +458,10 @@ async function visiblePosts(me, where) {
 // The topic if the caller may see it (same rules as the feed), else null. Commenting, liking
 // or quoting must not reveal posts from private authors or communities.
 async function findVisibleTopic(me, id, extra = {}) {
-  return prisma.topic.findFirst({ where: await visiblePosts(me, { id }), ...extra });
+  return prisma.topic.findFirst({
+    where: await visiblePosts(me, { id }),
+    ...extra,
+  });
 }
 
 async function listSummaries(req, where, { skip, take } = {}) {
@@ -1027,7 +1045,9 @@ app.post("/topics", authMiddleware, async (req, res) => {
     }
   }
   const quoted = quoted_id
-    ? await findVisibleTopic(req.user.sub, quoted_id, { include: { community: true, author: true } })
+    ? await findVisibleTopic(req.user.sub, quoted_id, {
+        include: { community: true, author: true },
+      })
     : null;
   if (quoted_id && !quoted) {
     return res.status(400).json({ error: "quoted_id does not exist" });
@@ -1035,9 +1055,13 @@ app.post("/topics", authMiddleware, async (req, res) => {
   // A quote shows an excerpt to everyone who sees the new post, so private posts can't be quoted.
   const quotedPrivate = quoted?.community
     ? quoted.community.is_private
-    : quoted && !quoted.author.is_public && quoted.author_username !== req.user.sub;
+    : quoted &&
+      !quoted.author.is_public &&
+      quoted.author_username !== req.user.sub;
   if (quotedPrivate) {
-    return res.status(403).json({ error: "Esse post é privado e não pode ser citado" });
+    return res
+      .status(403)
+      .json({ error: "Esse post é privado e não pode ser citado" });
   }
   let topic;
   try {
@@ -1370,10 +1394,18 @@ app.put("/communities/:id/cover", authMiddleware, async (req, res) => {
 // Uploaded content_type is client-controlled: anything but a plain image type (e.g. text/html)
 // would run as a page on this origin, where the admin panel keeps its token. Checked on serve
 // so rows stored before this check are covered too.
-const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+const IMAGE_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+]);
 
 function sendImage(res, data, contentType) {
-  res.set("Content-Type", IMAGE_TYPES.has(contentType) ? contentType : "image/jpeg");
+  res.set(
+    "Content-Type",
+    IMAGE_TYPES.has(contentType) ? contentType : "image/jpeg",
+  );
   res.set("X-Content-Type-Options", "nosniff");
   res.send(data);
 }
@@ -1833,20 +1865,29 @@ async function peopleList(req, usernames, extraByName = {}) {
 async function canSeeProfile(me, user) {
   if (user.is_public || user.username === me) return true;
   const row = await prisma.following.findUnique({
-    where: { follower_username_followed_username: { follower_username: me, followed_username: user.username } },
+    where: {
+      follower_username_followed_username: {
+        follower_username: me,
+        followed_username: user.username,
+      },
+    },
   });
   return !!row;
 }
 
 // Guards the followers/following lists of :username; sends 404/403 and returns false when hidden.
 async function peopleListAllowed(req, res) {
-  const user = await prisma.user.findUnique({ where: { username: req.params.username } });
+  const user = await prisma.user.findUnique({
+    where: { username: req.params.username },
+  });
   if (!user) {
     res.status(404).json({ error: "User not found" });
     return false;
   }
   if (!(await canSeeProfile(req.user.sub, user))) {
-    res.status(403).json({ error: "Perfil privado: só seguidores veem essa lista" });
+    res
+      .status(403)
+      .json({ error: "Perfil privado: só seguidores veem essa lista" });
     return false;
   }
   return true;
@@ -1872,9 +1913,15 @@ async function followingList(req, username) {
     orderBy: { followed_at: "desc" },
   });
   // last_active is only for your own list.
-  const extra = username === req.user.sub
-    ? Object.fromEntries(rows.map((r) => [r.followed_username, { last_active: r.last_active }]))
-    : {};
+  const extra =
+    username === req.user.sub
+      ? Object.fromEntries(
+          rows.map((r) => [
+            r.followed_username,
+            { last_active: r.last_active },
+          ]),
+        )
+      : {};
   return peopleList(
     req,
     rows.map((r) => r.followed_username),
@@ -1909,7 +1956,9 @@ app.get("/users/:username", authMiddleware, async (req, res) => {
     recent_posts,
     readings,
   ] = await Promise.all([
-    visiblePosts(me, { author_username: username }).then((where) => prisma.topic.count({ where })),
+    visiblePosts(me, { author_username: username }).then((where) =>
+      prisma.topic.count({ where }),
+    ),
     prisma.following.count({ where: { followed_username: username } }),
     prisma.following.count({ where: { follower_username: username } }),
     prisma.following.findUnique({
@@ -2097,7 +2146,8 @@ const DB_ENUMS = Object.fromEntries(
 const dbAdmin = [authMiddleware, requireRole("admin")];
 
 function dbModel(req, res) {
-  const model = Object.hasOwn(DB_MODELS, req.params.model) && DB_MODELS[req.params.model];
+  const model =
+    Object.hasOwn(DB_MODELS, req.params.model) && DB_MODELS[req.params.model];
   if (!model) res.status(404).json({ error: "Unknown model" });
   return model;
 }
@@ -2181,14 +2231,12 @@ app.post("/db/:model", dbAdmin, async (req, res) => {
   const model = dbModel(req, res);
   if (!model) return;
   try {
-    res
-      .status(201)
-      .json(
-        await prisma[model.delegate].create({
-          data: await dbData(model, req.body),
-          select: dbSelect(model),
-        }),
-      );
+    res.status(201).json(
+      await prisma[model.delegate].create({
+        data: await dbData(model, req.body),
+        select: dbSelect(model),
+      }),
+    );
   } catch (err) {
     dbError(res, err);
   }
@@ -2243,7 +2291,9 @@ app.use(
 // carry their status (413 too large, 400 bad JSON); bad field types reach Prisma as validation errors.
 app.use((err, req, res, next) => {
   if (err.type === "entity.too.large") {
-    return res.status(413).json({ error: "Conteúdo muito grande (imagens até 2 MB)" });
+    return res
+      .status(413)
+      .json({ error: "Conteúdo muito grande (imagens até 2 MB)" });
   }
   if (err.expose && err.status < 500) {
     return res.status(err.status).json({ error: "Requisição inválida" });
